@@ -1,0 +1,23 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]  # Required for WASM + optional native if you keep console support later
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }  # Client-side rendering for browser/WASM
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+js-sys = "0.3"
+
+web-sys = { version = "0.3", features = [
+    "Window",
+    "WebSocket",
+    "MessageEvent",
+    "ErrorEvent",
+    "CloseEvent",
+] }

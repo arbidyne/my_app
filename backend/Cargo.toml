@@ -1,0 +1,23 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ibapi = { version = "2.9.1", features = ["async"] }   # or latest; async uses tokio
+
+tokio = { version = "1", features = ["full"] }      # async runtime + channels + time
+futures = "0.3"                                     # StreamExt for subscription.next()
+
+# Core Axum with WebSockets
+axum = { version = "0.7", features = ["ws"] }  # "ws" enables WebSocketUpgrade extractor
+
+# Optional extras (only if you need them later; remove for now to minimize deps)
+# axum-extra = "0.9"  # ← remove or comment this line
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
