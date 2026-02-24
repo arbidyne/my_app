@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use leptos::prelude::*;
+use send_wrapper::SendWrapper;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -44,6 +46,38 @@ struct SubscribeRequest {
     exchange: String,
     currency: String,
 }
+
+// ---------------------------------------------------------------------------
+// ApexCharts JS interop helpers
+// ---------------------------------------------------------------------------
+
+fn create_apex_chart(el: &JsValue, options: &JsValue) -> JsValue {
+    let global = js_sys::global();
+    let apex_class: js_sys::Function = js_sys::Reflect::get(&global, &"ApexCharts".into())
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let chart =
+        js_sys::Reflect::construct(&apex_class, &js_sys::Array::of2(el, options)).unwrap();
+    let render: js_sys::Function = js_sys::Reflect::get(&chart, &"render".into())
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let _ = render.call0(&chart);
+    chart
+}
+
+fn destroy_apex_chart(chart: &JsValue) {
+    if let Ok(f) = js_sys::Reflect::get(chart, &"destroy".into())
+        .and_then(|v| v.dyn_into::<js_sys::Function>())
+    {
+        let _ = f.call0(chart);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
 
 #[component]
 fn PriceCard(price: PriceUpdate) -> impl IntoView {
@@ -92,6 +126,145 @@ fn PriceCard(price: PriceUpdate) -> impl IntoView {
 }
 
 #[component]
+fn CandlestickChart(
+    symbol: String,
+    bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
+) -> impl IntoView {
+    let chart_id = format!("chart-{}", symbol);
+    let chart_instance: Rc<RefCell<Option<JsValue>>> = Rc::new(RefCell::new(None));
+    let prev_bar_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let chart_ready = RwSignal::new(false);
+
+    // Effect: create/update chart when bar data for this symbol changes
+    {
+        let ci = chart_instance.clone();
+        let pbc = prev_bar_count;
+        let id = chart_id.clone();
+        let sym = symbol.clone();
+
+        Effect::new(move |_| {
+            let bars = bar_history.get().get(&sym).cloned().unwrap_or_default();
+            let count = bars.len();
+
+            // Only recreate chart when this symbol's bar count actually changes
+            if count == *pbc.borrow() {
+                return;
+            }
+            *pbc.borrow_mut() = count;
+
+            // Destroy previous chart instance
+            if let Some(old) = ci.borrow_mut().take() {
+                destroy_apex_chart(&old);
+                chart_ready.set(false);
+            }
+
+            if bars.is_empty() {
+                return;
+            }
+
+            let window = web_sys::window().unwrap();
+            let document = window.document().unwrap();
+            if let Some(el) = document.get_element_by_id(&id) {
+                let series_data: Vec<serde_json::Value> = bars
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "x": b.timestamp,
+                            "y": [b.open, b.high, b.low, b.close]
+                        })
+                    })
+                    .collect();
+
+                let options = serde_json::json!({
+                    "chart": {
+                        "type": "candlestick",
+                        "height": 300,
+                    },
+                    "series": [{
+                        "name": &sym,
+                        "data": series_data,
+                    }],
+                    "xaxis": { "type": "datetime" },
+                    "yaxis": { "tooltip": { "enabled": true } },
+                    "plotOptions": {
+                        "candlestick": {
+                            "colors": {
+                                "upward": "#22c55e",
+                                "downward": "#ef4444",
+                            }
+                        }
+                    },
+                    "grid": { "borderColor": "#e5e7eb" },
+                    "title": {
+                        "text": format!("{} - 1 Min", &sym),
+                        "align": "left",
+                        "style": { "fontSize": "14px", "color": "#333" },
+                    },
+                });
+
+                let opts_str = serde_json::to_string(&options).unwrap();
+                let opts_js = js_sys::JSON::parse(&opts_str).unwrap();
+                let el_js: JsValue = el.into();
+                let chart = create_apex_chart(&el_js, &opts_js);
+                *ci.borrow_mut() = Some(chart);
+                chart_ready.set(true);
+            }
+        });
+    }
+
+    // Cleanup: destroy chart when component unmounts
+    // SendWrapper is safe here because WASM is single-threaded.
+    {
+        let ci = SendWrapper::new(chart_instance);
+        on_cleanup(move || {
+            if let Some(chart) = ci.borrow_mut().take() {
+                destroy_apex_chart(&chart);
+            }
+        });
+    }
+
+    view! {
+        <div style="min-height: 300px; position: relative; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+            <div id=chart_id></div>
+            <div style=move || {
+                if chart_ready.get() {
+                    "display: none;"
+                } else {
+                    "position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #999; font-size: 0.9em;"
+                }
+            }>
+                "Loading chart data..."
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ContractRow(
+    symbol: String,
+    prices: RwSignal<HashMap<String, PriceUpdate>>,
+    bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
+) -> impl IntoView {
+    let sym_for_price = symbol.clone();
+    let sym_for_chart = symbol.clone();
+
+    view! {
+        <div style="display: flex; gap: 16px; align-items: flex-start;">
+            <div style="flex-shrink: 0; width: 320px;">
+                {move || {
+                    prices.get().get(&sym_for_price).cloned().map(|p| {
+                        view! { <PriceCard price=p /> }
+                    })
+                }}
+            </div>
+            <div style="flex: 1; min-width: 0;">
+                <CandlestickChart symbol=sym_for_chart bar_history=bar_history />
+            </div>
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
     let prices: RwSignal<HashMap<String, PriceUpdate>> = RwSignal::new(HashMap::new());
     let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
@@ -131,8 +304,13 @@ fn App() -> impl IntoView {
                             map.insert(update.symbol.clone(), update);
                         });
                     }
-                    Ok(ServerMessage::HistoricalBars { symbol, bars }) => {
-                        leptos::logging::log!("Received {} historical bars for {}", bars.len(), symbol);
+                    Ok(ServerMessage::HistoricalBars { symbol, mut bars }) => {
+                        bars.sort_by_key(|b| b.timestamp);
+                        leptos::logging::log!(
+                            "Received {} historical bars for {}",
+                            bars.len(),
+                            symbol
+                        );
                         bar_history.update(|map| {
                             map.insert(symbol, bars);
                         });
@@ -186,16 +364,17 @@ fn App() -> impl IntoView {
         symbol_input.set(String::new());
     };
 
-    // Sorted price list derived from the prices map
-    let sorted_prices = Memo::new(move |_| {
+    // Sorted symbol list — only changes when a new contract is added/removed.
+    // Price ticks update values but not keys, so this memo stays stable.
+    let sorted_symbols = Memo::new(move |_| {
         let map = prices.get();
-        let mut entries: Vec<PriceUpdate> = map.into_values().collect();
-        entries.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        entries
+        let mut symbols: Vec<String> = map.keys().cloned().collect();
+        symbols.sort();
+        symbols
     });
 
     view! {
-        <div style="font-family: 'Segoe UI', system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 24px;">
+        <div style="font-family: 'Segoe UI', system-ui, sans-serif; max-width: 1200px; margin: 40px auto; padding: 24px;">
             // Connection status
             <div style="margin-bottom: 20px; display: flex; align-items: center; gap: 8px;">
                 <span style=move || {
@@ -266,10 +445,10 @@ fn App() -> impl IntoView {
                 </div>
             </div>
 
-            // Price cards grid
+            // Contract rows (price card + candlestick chart)
             {move || {
-                let entries = sorted_prices.get();
-                if entries.is_empty() {
+                let symbols = sorted_symbols.get();
+                if symbols.is_empty() {
                     view! {
                         <div style="text-align: center; padding: 60px 0; color: #999;">
                             "No subscriptions yet. Add a contract above."
@@ -278,10 +457,18 @@ fn App() -> impl IntoView {
                         .into_any()
                 } else {
                     view! {
-                        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px;">
-                            {entries
+                        <div style="display: flex; flex-direction: column; gap: 16px;">
+                            {symbols
                                 .into_iter()
-                                .map(|p| view! { <PriceCard price=p /> })
+                                .map(|symbol| {
+                                    view! {
+                                        <ContractRow
+                                            symbol=symbol
+                                            prices=prices
+                                            bar_history=bar_history
+                                        />
+                                    }
+                                })
                                 .collect::<Vec<_>>()}
                         </div>
                     }
