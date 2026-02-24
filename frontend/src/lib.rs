@@ -44,6 +44,7 @@ struct PositionData {
 enum ServerMessage {
     PriceUpdate(PriceUpdate),
     HistoricalBars { symbol: String, bars: Vec<BarData> },
+    RealtimeBar { symbol: String, bar: BarData },
     PositionUpdate(PositionData),
 }
 
@@ -174,25 +175,29 @@ fn CandlestickChart(
 ) -> impl IntoView {
     let chart_id = format!("chart-{}", symbol);
     let chart_instance: Rc<RefCell<Option<JsValue>>> = Rc::new(RefCell::new(None));
-    let prev_bar_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let prev_fingerprint: Rc<RefCell<(usize, u64, u64)>> = Rc::new(RefCell::new((0, 0, 0)));
     let chart_ready = RwSignal::new(false);
 
     // Effect: create/update chart when bar data for this symbol changes
     {
         let ci = chart_instance.clone();
-        let pbc = prev_bar_count;
+        let pfp = prev_fingerprint;
         let id = chart_id.clone();
         let sym = symbol.clone();
 
         Effect::new(move |_| {
             let bars = bar_history.get().get(&sym).cloned().unwrap_or_default();
-            let count = bars.len();
+            let fingerprint = (
+                bars.len(),
+                bars.last().map_or(0, |b| b.close.to_bits()),
+                bars.last().map_or(0, |b| b.timestamp),
+            );
 
-            // Only recreate chart when this symbol's bar count actually changes
-            if count == *pbc.borrow() {
+            // Recreate chart when bar count, last close, or last timestamp changes
+            if fingerprint == *pfp.borrow() {
                 return;
             }
-            *pbc.borrow_mut() = count;
+            *pfp.borrow_mut() = fingerprint;
 
             // Destroy previous chart instance
             if let Some(old) = ci.borrow_mut().take() {
@@ -358,6 +363,20 @@ fn App() -> impl IntoView {
                         );
                         bar_history.update(|map| {
                             map.insert(symbol, bars);
+                        });
+                    }
+                    Ok(ServerMessage::RealtimeBar { symbol, bar }) => {
+                        bar_history.update(|map| {
+                            let bars = map.entry(symbol).or_default();
+                            if let Some(last) = bars.last_mut() {
+                                if last.timestamp == bar.timestamp {
+                                    *last = bar;
+                                } else {
+                                    bars.push(bar);
+                                }
+                            } else {
+                                bars.push(bar);
+                            }
                         });
                     }
                     Ok(ServerMessage::PositionUpdate(pos)) => {

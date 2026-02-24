@@ -15,6 +15,7 @@ use axum::{
 };
 use ibapi::accounts::PositionUpdate as IbPositionUpdate;
 use ibapi::contracts::Contract;
+use ibapi::market_data::historical::HistoricalBarUpdate;
 use ibapi::market_data::realtime::BidAsk;
 use ibapi::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,10 @@ enum ServerMessage {
     HistoricalBars {
         symbol: String,
         bars: Vec<BarData>,
+    },
+    RealtimeBar {
+        symbol: String,
+        bar: BarData,
     },
     PositionUpdate(PositionData),
 }
@@ -300,7 +305,7 @@ async fn subscription_manager(
             }
         });
 
-        // Spawn one-shot historical data fetch task
+        // Spawn streaming historical data task (initial bars + live updates)
         let client_hist = client.clone();
         let msg_tx_hist = msg_tx.clone();
         let symbol_hist = symbol.clone();
@@ -308,41 +313,86 @@ async fn subscription_manager(
         let bar_cache_hist = bar_cache.clone();
         tokio::spawn(async move {
             match client_hist
-                .historical_data(
+                .historical_data_streaming(
                     &contract_hist,
-                    None,                                  // end_date = now
-                    1.days(),                              // 1 day of data
-                    HistoricalBarSize::Min,                // 1-minute bars
-                    Some(HistoricalWhatToShow::Trades),    // trade data
-                    TradingHours::Extended,                // include extended hours
+                    1.days(),
+                    HistoricalBarSize::Min,
+                    Some(HistoricalWhatToShow::Trades),
+                    TradingHours::Extended,
+                    true,
                 )
                 .await
             {
-                Ok(data) => {
-                    let bars: Vec<BarData> = data
-                        .bars
-                        .iter()
-                        .map(|b| BarData {
-                            timestamp: b.date.unix_timestamp() as u64 * 1000,
-                            open: b.open,
-                            high: b.high,
-                            low: b.low,
-                            close: b.close,
-                            volume: b.volume,
-                        })
-                        .collect();
-                    info!("{symbol_hist}: caching and broadcasting {} historical bars", bars.len());
-                    bar_cache_hist
-                        .write()
-                        .await
-                        .insert(symbol_hist.clone(), bars.clone());
-                    let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
-                        symbol: symbol_hist,
-                        bars,
-                    });
+                Ok(mut subscription) => {
+                    info!("{symbol_hist}: streaming historical data started");
+                    while let Some(update) = subscription.next().await {
+                        match update {
+                            HistoricalBarUpdate::Historical(data) => {
+                                let bars: Vec<BarData> = data
+                                    .bars
+                                    .iter()
+                                    .map(|b| BarData {
+                                        timestamp: b.date.unix_timestamp() as u64 * 1000,
+                                        open: b.open,
+                                        high: b.high,
+                                        low: b.low,
+                                        close: b.close,
+                                        volume: b.volume,
+                                    })
+                                    .collect();
+                                info!(
+                                    "{symbol_hist}: caching and broadcasting {} historical bars",
+                                    bars.len()
+                                );
+                                bar_cache_hist
+                                    .write()
+                                    .await
+                                    .insert(symbol_hist.clone(), bars.clone());
+                                let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
+                                    symbol: symbol_hist.clone(),
+                                    bars,
+                                });
+                            }
+                            HistoricalBarUpdate::Update(bar) => {
+                                let bar_data = BarData {
+                                    timestamp: bar.date.unix_timestamp() as u64 * 1000,
+                                    open: bar.open,
+                                    high: bar.high,
+                                    low: bar.low,
+                                    close: bar.close,
+                                    volume: bar.volume,
+                                };
+
+                                // Update cache: replace last bar if same timestamp, else append
+                                {
+                                    let mut cache = bar_cache_hist.write().await;
+                                    let bars =
+                                        cache.entry(symbol_hist.clone()).or_default();
+                                    if let Some(last) = bars.last_mut() {
+                                        if last.timestamp == bar_data.timestamp {
+                                            *last = bar_data.clone();
+                                        } else {
+                                            bars.push(bar_data.clone());
+                                        }
+                                    } else {
+                                        bars.push(bar_data.clone());
+                                    }
+                                }
+
+                                let _ = msg_tx_hist.send(ServerMessage::RealtimeBar {
+                                    symbol: symbol_hist.clone(),
+                                    bar: bar_data,
+                                });
+                            }
+                            HistoricalBarUpdate::End { .. } => {
+                                info!("{symbol_hist}: historical streaming ended");
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
-                    error!("{symbol_hist}: historical data fetch failed: {e}");
+                    error!("{symbol_hist}: historical data streaming failed: {e}");
                 }
             }
         });
