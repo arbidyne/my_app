@@ -17,9 +17,9 @@ use ibapi::contracts::Contract;
 use ibapi::market_data::realtime::BidAsk;
 use ibapi::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info};
 
 /// Single OHLCV bar converted from ibapi's historical Bar.
@@ -75,6 +75,7 @@ struct SubscribeRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     Subscribe(SubscribeRequest),
+    RequestBars { symbol: String },
 }
 
 /// Shared application state passed to all handlers.
@@ -82,6 +83,7 @@ enum ClientMessage {
 struct AppState {
     msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
+    bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
 }
 
 #[tokio::main]
@@ -96,15 +98,21 @@ async fn main() -> Result<()> {
     // mpsc channel: WebSocket handlers send subscribe requests to the subscription manager.
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<SubscribeRequest>(32);
 
+    // Shared cache of historical bars per symbol, populated by subscription_manager.
+    let bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn subscription manager that connects to IBKR and handles subscribe requests.
     let msg_tx_clone = msg_tx.clone();
+    let bar_cache_clone = bar_cache.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, msg_tx_clone).await;
+        subscription_manager(subscribe_rx, msg_tx_clone, bar_cache_clone).await;
     });
 
     let state = AppState {
         msg_tx,
         subscribe_tx,
+        bar_cache,
     };
 
     let app = Router::new()
@@ -123,6 +131,7 @@ async fn main() -> Result<()> {
 async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
     msg_tx: broadcast::Sender<ServerMessage>,
+    bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -226,6 +235,7 @@ async fn subscription_manager(
         let msg_tx_hist = msg_tx.clone();
         let symbol_hist = symbol.clone();
         let contract_hist = contract.clone();
+        let bar_cache_hist = bar_cache.clone();
         tokio::spawn(async move {
             match client_hist
                 .historical_data(
@@ -251,7 +261,11 @@ async fn subscription_manager(
                             volume: b.volume,
                         })
                         .collect();
-                    info!("{symbol_hist}: broadcasting {} historical bars", bars.len());
+                    info!("{symbol_hist}: caching and broadcasting {} historical bars", bars.len());
+                    bar_cache_hist
+                        .write()
+                        .await
+                        .insert(symbol_hist.clone(), bars.clone());
                     let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
                         symbol: symbol_hist,
                         bars,
@@ -272,7 +286,8 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     let rx = state.msg_tx.subscribe();
     let subscribe_tx = state.subscribe_tx.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx))
+    let bar_cache = state.bar_cache.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx, bar_cache))
 }
 
 /// Bidirectional WebSocket handler:
@@ -282,6 +297,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
+    bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
 ) {
     loop {
         tokio::select! {
@@ -307,6 +323,21 @@ async fn handle_socket(
                             Ok(ClientMessage::Subscribe(req)) => {
                                 info!("Client subscribe request: {} on {}", req.symbol, req.exchange);
                                 let _ = subscribe_tx.send(req).await;
+                            }
+                            Ok(ClientMessage::RequestBars { symbol }) => {
+                                let cache = bar_cache.read().await;
+                                if let Some(bars) = cache.get(&symbol) {
+                                    info!("Sending {} cached bars for {symbol}", bars.len());
+                                    let msg = ServerMessage::HistoricalBars {
+                                        symbol,
+                                        bars: bars.clone(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&msg) {
+                                        if socket.send(Message::Text(json)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 info!("Invalid client message: {e}");

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -45,6 +45,12 @@ struct SubscribeRequest {
     security_type: String,
     exchange: String,
     currency: String,
+}
+
+#[derive(Serialize)]
+struct RequestBarsMsg {
+    r#type: String,
+    symbol: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +346,33 @@ fn App() -> impl IntoView {
 
         // Keep the WebSocket alive — dropping it would release the JS reference.
         std::mem::forget(ws);
+    });
+
+    // Auto-request historical bars for symbols that have price data but no chart data.
+    // This handles reconnection: after a page refresh, incoming PriceUpdates reveal
+    // which symbols are active, and this effect requests their cached bars from the backend.
+    let requested_bars: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+    let ws_ref_bars = ws_ref.clone();
+    let requested_bars_clone = requested_bars.clone();
+    Effect::new(move |_| {
+        let price_map = prices.get();
+        let bar_map = bar_history.get();
+        let mut requested = requested_bars_clone.borrow_mut();
+
+        for symbol in price_map.keys() {
+            if !bar_map.contains_key(symbol) && requested.insert(symbol.clone()) {
+                let msg = RequestBarsMsg {
+                    r#type: "request_bars".to_string(),
+                    symbol: symbol.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if let Some(ws) = ws_ref_bars.borrow().as_ref() {
+                        let _ = ws.send_with_str(&json);
+                        leptos::logging::log!("Requested cached bars for {}", symbol);
+                    }
+                }
+            }
+        }
     });
 
     // Submit handler: send subscribe request over WebSocket
