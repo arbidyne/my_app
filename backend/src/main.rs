@@ -4,6 +4,7 @@
 //!
 //! Clients send subscribe requests (symbol, security_type, exchange, currency) and the
 //! server manages one subscription per unique contract, broadcasting updates to all clients.
+//! On subscription, also fetches 1 day of historical minute bars and broadcasts them.
 
 use anyhow::Result;
 use axum::{
@@ -19,19 +20,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
-/// Payload sent to WebSocket clients for each tick update (best bid/ask from top of book).
+/// Single OHLCV bar converted from ibapi's historical Bar.
 #[derive(Clone, Debug, Serialize)]
-struct PriceUpdate {
-    symbol: String,
-    /// Mid price (bid + ask) / 2 for display; tick stream is bid/ask only.
-    last_price: f64,
+struct BarData {
     timestamp: u64, // Unix time in milliseconds
-    best_bid_price: f64,
-    best_bid_size: f64,
-    best_ask_price: f64,
-    best_ask_size: f64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+
+/// All server-to-client WebSocket messages, tagged by "type".
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ServerMessage {
+    PriceUpdate {
+        symbol: String,
+        last_price: f64,
+        timestamp: u64,
+        best_bid_price: f64,
+        best_bid_size: f64,
+        best_ask_price: f64,
+        best_ask_size: f64,
+    },
+    HistoricalBars {
+        symbol: String,
+        bars: Vec<BarData>,
+    },
 }
 
 /// Unique key for deduplicating contract subscriptions.
@@ -62,7 +80,7 @@ enum ClientMessage {
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 struct AppState {
-    price_tx: broadcast::Sender<PriceUpdate>,
+    msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
 }
 
@@ -73,19 +91,19 @@ async fn main() -> Result<()> {
         .init();
 
     // Broadcast channel: subscription tasks publish, each WebSocket client gets a receiver.
-    let (price_tx, _) = broadcast::channel::<PriceUpdate>(100);
+    let (msg_tx, _) = broadcast::channel::<ServerMessage>(100);
 
     // mpsc channel: WebSocket handlers send subscribe requests to the subscription manager.
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<SubscribeRequest>(32);
 
     // Spawn subscription manager that connects to IBKR and handles subscribe requests.
-    let price_tx_clone = price_tx.clone();
+    let msg_tx_clone = msg_tx.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, price_tx_clone).await;
+        subscription_manager(subscribe_rx, msg_tx_clone).await;
     });
 
     let state = AppState {
-        price_tx,
+        msg_tx,
         subscribe_tx,
     };
 
@@ -101,11 +119,10 @@ async fn main() -> Result<()> {
 }
 
 /// Connects to IB Gateway once and manages subscriptions for all requested contracts.
-/// Listens for `SubscribeRequest` messages; for each unique contract, spawns a task
-/// that streams tick-by-tick bid/ask data into the broadcast channel.
+/// For each unique contract, spawns a tick-by-tick task and a one-shot historical data fetch.
 async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
-    price_tx: broadcast::Sender<PriceUpdate>,
+    msg_tx: broadcast::Sender<ServerMessage>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -135,22 +152,27 @@ async fn subscription_manager(
             continue;
         }
 
-        let client = client.clone();
-        let price_tx = price_tx.clone();
+        let contract = Contract {
+            symbol: Symbol(req.symbol.clone()),
+            security_type: SecurityType::from(req.security_type.as_str()),
+            exchange: Exchange(req.exchange),
+            currency: Currency(req.currency),
+            ..Default::default()
+        };
         let symbol = req.symbol.clone();
 
+        // Spawn tick-by-tick bid/ask streaming task
+        let client_tick = client.clone();
+        let msg_tx_tick = msg_tx.clone();
+        let symbol_tick = symbol.clone();
+        let contract_tick = contract.clone();
         tokio::spawn(async move {
-            let contract = Contract {
-                symbol: Symbol(req.symbol.clone()),
-                security_type: SecurityType::from(req.security_type.as_str()),
-                exchange: Exchange(req.exchange),
-                currency: Currency(req.currency),
-                ..Default::default()
-            };
-
-            match client.tick_by_tick_bid_ask(&contract, 0, false).await {
+            match client_tick
+                .tick_by_tick_bid_ask(&contract_tick, 0, false)
+                .await
+            {
                 Ok(mut subscription) => {
-                    info!("Subscribed to tick-by-tick bid/ask for {symbol}");
+                    info!("Subscribed to tick-by-tick bid/ask for {symbol_tick}");
 
                     while let Some(tick_result) = subscription.next().await {
                         match tick_result {
@@ -171,8 +193,8 @@ async fn subscription_manager(
                                     bid_price
                                 };
 
-                                let update = PriceUpdate {
-                                    symbol: symbol.clone(),
+                                let msg = ServerMessage::PriceUpdate {
+                                    symbol: symbol_tick.clone(),
                                     last_price,
                                     timestamp: timestamp_ms,
                                     best_bid_price: bid_price,
@@ -181,20 +203,62 @@ async fn subscription_manager(
                                     best_ask_size: ask_size,
                                 };
 
-                                let _ = price_tx.send(update.clone());
-                                info!(
-                                    "{symbol} tick: bid {bid_price} x {bid_size} | ask {ask_price} x {ask_size} @ {timestamp_ms}"
+                                let _ = msg_tx_tick.send(msg);
+                                debug!(
+                                    "{symbol_tick} tick: bid {bid_price} x {bid_size} | ask {ask_price} x {ask_size} @ {timestamp_ms}"
                                 );
                             }
                             Err(e) => {
-                                error!("{symbol} tick subscription error: {e}");
+                                error!("{symbol_tick} tick subscription error: {e}");
                                 break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Failed to subscribe to {symbol}: {e}");
+                    error!("Failed to subscribe to tick data for {symbol_tick}: {e}");
+                }
+            }
+        });
+
+        // Spawn one-shot historical data fetch task
+        let client_hist = client.clone();
+        let msg_tx_hist = msg_tx.clone();
+        let symbol_hist = symbol.clone();
+        let contract_hist = contract.clone();
+        tokio::spawn(async move {
+            match client_hist
+                .historical_data(
+                    &contract_hist,
+                    None,                                  // end_date = now
+                    1.days(),                              // 1 day of data
+                    HistoricalBarSize::Min,                // 1-minute bars
+                    Some(HistoricalWhatToShow::Trades),    // trade data
+                    TradingHours::Extended,                // include extended hours
+                )
+                .await
+            {
+                Ok(data) => {
+                    let bars: Vec<BarData> = data
+                        .bars
+                        .iter()
+                        .map(|b| BarData {
+                            timestamp: b.date.unix_timestamp() as u64 * 1000,
+                            open: b.open,
+                            high: b.high,
+                            low: b.low,
+                            close: b.close,
+                            volume: b.volume,
+                        })
+                        .collect();
+                    info!("{symbol_hist}: broadcasting {} historical bars", bars.len());
+                    let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
+                        symbol: symbol_hist,
+                        bars,
+                    });
+                }
+                Err(e) => {
+                    error!("{symbol_hist}: historical data fetch failed: {e}");
                 }
             }
         });
@@ -206,25 +270,25 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    let rx = state.price_tx.subscribe();
+    let rx = state.msg_tx.subscribe();
     let subscribe_tx = state.subscribe_tx.clone();
     ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx))
 }
 
 /// Bidirectional WebSocket handler:
-/// - Forwards PriceUpdates from broadcast channel to client
+/// - Forwards ServerMessages from broadcast channel to client
 /// - Reads subscribe requests from client and forwards to subscription manager
 async fn handle_socket(
     mut socket: WebSocket,
-    mut rx: broadcast::Receiver<PriceUpdate>,
+    mut rx: broadcast::Receiver<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
 ) {
     loop {
         tokio::select! {
             result = rx.recv() => {
                 match result {
-                    Ok(update) => {
-                        if let Ok(json) = serde_json::to_string(&update) {
+                    Ok(msg) => {
+                        if let Ok(json) = serde_json::to_string(&msg) {
                             if socket.send(Message::Text(json)).await.is_err() {
                                 break;
                             }

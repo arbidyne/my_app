@@ -18,6 +18,24 @@ struct PriceUpdate {
     best_ask_size: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct BarData {
+    timestamp: u64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+
+/// Tagged enum matching the backend's ServerMessage.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ServerMessage {
+    PriceUpdate(PriceUpdate),
+    HistoricalBars { symbol: String, bars: Vec<BarData> },
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct SubscribeRequest {
     r#type: String,
@@ -76,6 +94,7 @@ fn PriceCard(price: PriceUpdate) -> impl IntoView {
 #[component]
 fn App() -> impl IntoView {
     let prices: RwSignal<HashMap<String, PriceUpdate>> = RwSignal::new(HashMap::new());
+    let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -106,10 +125,16 @@ fn App() -> impl IntoView {
         // --- onmessage ---
         let onmessage = Closure::<dyn Fn(MessageEvent)>::new(move |e: MessageEvent| {
             if let Some(text) = e.data().as_string() {
-                match serde_json::from_str::<PriceUpdate>(&text) {
-                    Ok(update) => {
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::PriceUpdate(update)) => {
                         prices.update(|map| {
                             map.insert(update.symbol.clone(), update);
+                        });
+                    }
+                    Ok(ServerMessage::HistoricalBars { symbol, bars }) => {
+                        leptos::logging::log!("Received {} historical bars for {}", bars.len(), symbol);
+                        bar_history.update(|map| {
+                            map.insert(symbol, bars);
                         });
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
