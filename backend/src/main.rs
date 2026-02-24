@@ -122,8 +122,9 @@ async fn main() -> Result<()> {
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
     let position_cache_clone = position_cache.clone();
+    let subscribe_tx_clone = subscribe_tx.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, msg_tx_clone, bar_cache_clone, position_cache_clone)
+        subscription_manager(subscribe_rx, subscribe_tx_clone, msg_tx_clone, bar_cache_clone, position_cache_clone)
             .await;
     });
 
@@ -149,6 +150,7 @@ async fn main() -> Result<()> {
 /// For each unique contract, spawns a tick-by-tick task and a one-shot historical data fetch.
 async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
+    subscribe_tx: mpsc::Sender<SubscribeRequest>,
     msg_tx: broadcast::Sender<ServerMessage>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
@@ -167,6 +169,7 @@ async fn subscription_manager(
     let client_pos = client.clone();
     let msg_tx_pos = msg_tx.clone();
     let position_cache_pos = position_cache.clone();
+    let subscribe_tx_pos = subscribe_tx.clone();
     tokio::spawn(async move {
         match client_pos.positions().await {
             Ok(mut subscription) => {
@@ -186,6 +189,12 @@ async fn subscription_manager(
                                 .await
                                 .insert(symbol.clone(), data.clone());
                             let _ = msg_tx_pos.send(ServerMessage::PositionUpdate(data));
+                            let _ = subscribe_tx_pos.send(SubscribeRequest {
+                                symbol: pos.contract.symbol.0.clone(),
+                                security_type: pos.contract.security_type.to_string(),
+                                exchange: pos.contract.exchange.0.clone(),
+                                currency: pos.contract.currency.0.clone(),
+                            }).await;
                             debug!("Position update: {symbol}");
                         }
                         Ok(IbPositionUpdate::PositionEnd) => {
