@@ -13,6 +13,7 @@ use axum::{
     routing::get,
     Router,
 };
+use ibapi::accounts::PositionUpdate as IbPositionUpdate;
 use ibapi::contracts::Contract;
 use ibapi::market_data::realtime::BidAsk;
 use ibapi::prelude::*;
@@ -33,6 +34,15 @@ struct BarData {
     volume: f64,
 }
 
+/// Position data for a single holding.
+#[derive(Clone, Debug, Serialize)]
+struct PositionData {
+    symbol: String,
+    position_size: f64,
+    average_cost: f64,
+    account: String,
+}
+
 /// All server-to-client WebSocket messages, tagged by "type".
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,6 +60,7 @@ enum ServerMessage {
         symbol: String,
         bars: Vec<BarData>,
     },
+    PositionUpdate(PositionData),
 }
 
 /// Unique key for deduplicating contract subscriptions.
@@ -84,6 +95,7 @@ struct AppState {
     msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
+    position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
 }
 
 #[tokio::main]
@@ -102,17 +114,24 @@ async fn main() -> Result<()> {
     let bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Shared cache of positions per symbol, populated by positions subscription.
+    let position_cache: Arc<RwLock<HashMap<String, PositionData>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn subscription manager that connects to IBKR and handles subscribe requests.
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
+    let position_cache_clone = position_cache.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, msg_tx_clone, bar_cache_clone).await;
+        subscription_manager(subscribe_rx, msg_tx_clone, bar_cache_clone, position_cache_clone)
+            .await;
     });
 
     let state = AppState {
         msg_tx,
         subscribe_tx,
         bar_cache,
+        position_cache,
     };
 
     let app = Router::new()
@@ -132,6 +151,7 @@ async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
     msg_tx: broadcast::Sender<ServerMessage>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
+    position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -142,6 +162,47 @@ async fn subscription_manager(
     };
 
     info!("Connected to IBKR, waiting for subscription requests");
+
+    // Spawn positions subscription — streams all current positions then live updates.
+    let client_pos = client.clone();
+    let msg_tx_pos = msg_tx.clone();
+    let position_cache_pos = position_cache.clone();
+    tokio::spawn(async move {
+        match client_pos.positions().await {
+            Ok(mut subscription) => {
+                info!("Subscribed to positions");
+                while let Some(result) = subscription.next().await {
+                    match result {
+                        Ok(IbPositionUpdate::Position(pos)) => {
+                            let symbol = pos.contract.symbol.0.clone();
+                            let data = PositionData {
+                                symbol: symbol.clone(),
+                                position_size: pos.position,
+                                average_cost: pos.average_cost,
+                                account: pos.account,
+                            };
+                            position_cache_pos
+                                .write()
+                                .await
+                                .insert(symbol.clone(), data.clone());
+                            let _ = msg_tx_pos.send(ServerMessage::PositionUpdate(data));
+                            debug!("Position update: {symbol}");
+                        }
+                        Ok(IbPositionUpdate::PositionEnd) => {
+                            info!("Initial position snapshot complete");
+                        }
+                        Err(e) => {
+                            error!("Position subscription error: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to subscribe to positions: {e}");
+            }
+        }
+    });
 
     let mut subscribed: HashSet<ContractKey> = HashSet::new();
 
@@ -287,7 +348,8 @@ async fn ws_handler(
     let rx = state.msg_tx.subscribe();
     let subscribe_tx = state.subscribe_tx.clone();
     let bar_cache = state.bar_cache.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx, bar_cache))
+    let position_cache = state.position_cache.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx, bar_cache, position_cache))
 }
 
 /// Bidirectional WebSocket handler:
@@ -298,7 +360,21 @@ async fn handle_socket(
     mut rx: broadcast::Receiver<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
+    position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
 ) {
+    // Send cached positions to newly connected client.
+    {
+        let cache = position_cache.read().await;
+        for pos in cache.values() {
+            let msg = ServerMessage::PositionUpdate(pos.clone());
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(Message::Text(json)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             result = rx.recv() => {

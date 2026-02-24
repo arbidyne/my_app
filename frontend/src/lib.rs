@@ -30,12 +30,21 @@ struct BarData {
     volume: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct PositionData {
+    symbol: String,
+    position_size: f64,
+    average_cost: f64,
+    account: String,
+}
+
 /// Tagged enum matching the backend's ServerMessage.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
     PriceUpdate(PriceUpdate),
     HistoricalBars { symbol: String, bars: Vec<BarData> },
+    PositionUpdate(PositionData),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,7 +95,7 @@ fn destroy_apex_chart(chart: &JsValue) {
 // ---------------------------------------------------------------------------
 
 #[component]
-fn PriceCard(price: PriceUpdate) -> impl IntoView {
+fn PriceCard(price: PriceUpdate, position: Option<PositionData>) -> impl IntoView {
     let ts_secs = (price.timestamp / 1000) as f64;
     let date = js_sys::Date::new(&JsValue::from_f64(ts_secs * 1000.0));
     let time_str = format!(
@@ -95,6 +104,31 @@ fn PriceCard(price: PriceUpdate) -> impl IntoView {
         date.get_minutes(),
         date.get_seconds(),
     );
+
+    let position_section = position.map(|pos| {
+        let size_color = if pos.position_size >= 0.0 { "#16a34a" } else { "#dc2626" };
+        let size_str = if pos.position_size == pos.position_size.trunc() {
+            format!("{:+.0}", pos.position_size)
+        } else {
+            format!("{:+}", pos.position_size)
+        };
+        view! {
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px;">
+                <div style="background: #f0f4ff; border-radius: 8px; padding: 12px;">
+                    <div style="font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Position"</div>
+                    <div style=format!("font-size: 1.25em; font-weight: 600; color: {size_color};")>
+                        {size_str}
+                    </div>
+                </div>
+                <div style="background: #f0f4ff; border-radius: 8px; padding: 12px;">
+                    <div style="font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Avg Cost"</div>
+                    <div style="font-size: 1.25em; font-weight: 600; color: #333;">
+                        {format!("{:.2}", pos.average_cost)}
+                    </div>
+                </div>
+            </div>
+        }
+    });
 
     view! {
         <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
@@ -127,6 +161,8 @@ fn PriceCard(price: PriceUpdate) -> impl IntoView {
                     </div>
                 </div>
             </div>
+
+            {position_section}
         </div>
     }
 }
@@ -250,6 +286,7 @@ fn ContractRow(
     symbol: String,
     prices: RwSignal<HashMap<String, PriceUpdate>>,
     bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
+    positions: RwSignal<HashMap<String, PositionData>>,
 ) -> impl IntoView {
     let sym_for_price = symbol.clone();
     let sym_for_chart = symbol.clone();
@@ -259,7 +296,8 @@ fn ContractRow(
             <div style="flex-shrink: 0; width: 320px;">
                 {move || {
                     prices.get().get(&sym_for_price).cloned().map(|p| {
-                        view! { <PriceCard price=p /> }
+                        let pos = positions.get().get(&sym_for_price).cloned();
+                        view! { <PriceCard price=p position=pos /> }
                     })
                 }}
             </div>
@@ -274,6 +312,7 @@ fn ContractRow(
 fn App() -> impl IntoView {
     let prices: RwSignal<HashMap<String, PriceUpdate>> = RwSignal::new(HashMap::new());
     let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
+    let positions: RwSignal<HashMap<String, PositionData>> = RwSignal::new(HashMap::new());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -319,6 +358,11 @@ fn App() -> impl IntoView {
                         );
                         bar_history.update(|map| {
                             map.insert(symbol, bars);
+                        });
+                    }
+                    Ok(ServerMessage::PositionUpdate(pos)) => {
+                        positions.update(|map| {
+                            map.insert(pos.symbol.clone(), pos);
                         });
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
@@ -499,6 +543,7 @@ fn App() -> impl IntoView {
                                             symbol=symbol
                                             prices=prices
                                             bar_history=bar_history
+                                            positions=positions
                                         />
                                     }
                                 })
