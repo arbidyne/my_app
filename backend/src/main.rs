@@ -434,6 +434,22 @@ async fn handle_socket(
         }
     }
 
+    // Send cached bars to newly connected client.
+    {
+        let cache = bar_cache.read().await;
+        for (symbol, bars) in cache.iter() {
+            let msg = ServerMessage::HistoricalBars {
+                symbol: symbol.clone(),
+                bars: bars.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(Message::Text(json)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             result = rx.recv() => {
