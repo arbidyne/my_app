@@ -49,3 +49,9 @@ cargo test test_name          # single test by name
 - [Trunk](https://trunkrs.dev/) must be installed for frontend builds (`cargo install trunk`)
 - IB Gateway or TWS must be running on `127.0.0.1:7496` for the backend to connect
 - `wasm32-unknown-unknown` target must be installed (`rustup target add wasm32-unknown-unknown`)
+
+# Documentation Standards
+- follow [API Guidelines](https://rust-lang.github.io).
+- In general, explain the "why" not the "what".
+- Do not comment trivial getter/setter methods.
+- Reference other modules if the function depends on them.

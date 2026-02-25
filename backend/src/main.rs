@@ -5,6 +5,10 @@
 //! Clients send subscribe requests (symbol, security_type, exchange, currency) and the
 //! server manages one subscription per unique contract, broadcasting updates to all clients.
 //! On subscription, also fetches 1 day of historical minute bars and broadcasts them.
+//!
+//! IBKR limits concurrent gateway connections, so this server maintains a single connection
+//! and fans out data to many browser clients via WebSocket. A broadcast channel lets each
+//! client receive all messages independently without per-client send logic.
 
 use anyhow::Result;
 use axum::{
@@ -24,7 +28,8 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info};
 
-/// Single OHLCV bar converted from ibapi's historical Bar.
+/// Decoupled from ibapi's `Bar` so we control serde serialization and normalize
+/// timestamps to milliseconds (JS/frontend convention).
 #[derive(Clone, Debug, Serialize)]
 struct BarData {
     timestamp: u64, // Unix time in milliseconds
@@ -35,7 +40,7 @@ struct BarData {
     volume: f64,
 }
 
-/// Position data for a single holding.
+/// Flattened from ibapi's nested `Position` to include only the fields the UI needs.
 #[derive(Clone, Debug, Serialize)]
 struct PositionData {
     symbol: String,
@@ -44,7 +49,8 @@ struct PositionData {
     account: String,
 }
 
-/// All server-to-client WebSocket messages, tagged by "type".
+/// Single enum for all server→client messages so one broadcast channel carries everything.
+/// `serde(tag = "type")` emits a discriminator field so the frontend can route by message kind.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
@@ -68,7 +74,8 @@ enum ServerMessage {
     PositionUpdate(PositionData),
 }
 
-/// Unique key for deduplicating contract subscriptions.
+/// IBKR rejects duplicate subscriptions and charges per active subscription, so we dedup
+/// by the four fields that uniquely identify a contract.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct ContractKey {
     symbol: String,
@@ -77,7 +84,7 @@ struct ContractKey {
     currency: String,
 }
 
-/// Client subscribe request matching the JSON protocol.
+/// Mirrors the four fields IBKR requires to identify a contract.
 #[derive(Clone, Debug, Deserialize)]
 struct SubscribeRequest {
     symbol: String,
@@ -86,7 +93,8 @@ struct SubscribeRequest {
     currency: String,
 }
 
-/// Tagged enum for all client-to-server WebSocket messages.
+/// `RequestBars` exists as a fallback for clients that connect before bar data is cached.
+/// Tagged enum so the same WebSocket carries both subscription and data requests.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
@@ -94,7 +102,8 @@ enum ClientMessage {
     RequestBars { symbol: String },
 }
 
-/// Shared application state passed to all handlers.
+/// Caches use `Arc<RwLock<>>` because many WebSocket tasks read concurrently while only
+/// the subscription manager writes.
 #[derive(Clone)]
 struct AppState {
     msg_tx: broadcast::Sender<ServerMessage>,
@@ -109,21 +118,21 @@ async fn main() -> Result<()> {
         .with_env_filter("info")
         .init();
 
-    // Broadcast channel: subscription tasks publish, each WebSocket client gets a receiver.
+    // Broadcast (not mpsc) so each client gets its own receiver — fan-out without explicit per-client send logic.
     let (msg_tx, _) = broadcast::channel::<ServerMessage>(100);
 
-    // mpsc channel: WebSocket handlers send subscribe requests to the subscription manager.
+    // Funneled through mpsc so a single manager task can dedup and prevent duplicate IBKR subscriptions.
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<SubscribeRequest>(32);
 
-    // Shared cache of historical bars per symbol, populated by subscription_manager.
+    // Cached server-side so clients connecting after the initial broadcast still get full bar history.
     let bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Shared cache of positions per symbol, populated by positions subscription.
+    // Cached so late-joining clients see current positions without waiting for the next IBKR update.
     let position_cache: Arc<RwLock<HashMap<String, PositionData>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Spawn subscription manager that connects to IBKR and handles subscribe requests.
+    // Runs in a dedicated task so the HTTP server can start accepting connections immediately.
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
     let position_cache_clone = position_cache.clone();
@@ -151,8 +160,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Connects to IB Gateway once and manages subscriptions for all requested contracts.
-/// For each unique contract, spawns a tick-by-tick task and a one-shot historical data fetch.
+/// Single long-lived IBKR connection shared across all subscriptions — IBKR limits concurrent
+/// gateway connections, so one connection avoids exhausting connection slots.
 async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
@@ -170,7 +179,8 @@ async fn subscription_manager(
 
     info!("Connected to IBKR, waiting for subscription requests");
 
-    // Spawn positions subscription — streams all current positions then live updates.
+    // Positions auto-subscribe to price data so users see live prices for their holdings
+    // without manually subscribing to each one.
     let client_pos = client.clone();
     let msg_tx_pos = msg_tx.clone();
     let position_cache_pos = position_cache.clone();
@@ -245,7 +255,7 @@ async fn subscription_manager(
         };
         let symbol = req.symbol.clone();
 
-        // Spawn tick-by-tick bid/ask streaming task
+        // Tick-by-tick streaming (not snapshot polling) to minimize latency and API rate limit usage.
         let client_tick = client.clone();
         let msg_tx_tick = msg_tx.clone();
         let symbol_tick = symbol.clone();
@@ -269,6 +279,8 @@ async fn subscription_manager(
                                 ..
                             }) => {
                                 let timestamp_ms = time.unix_timestamp() as u64 * 1000;
+                                // Mid-price when both sides are quoted; fall back to whichever
+                                // side exists (pre/post-market often has only one side).
                                 let last_price = if bid_price > 0.0 && ask_price > 0.0 {
                                     (bid_price + ask_price) / 2.0
                                 } else if ask_price > 0.0 {
@@ -305,7 +317,8 @@ async fn subscription_manager(
             }
         });
 
-        // Spawn streaming historical data task (initial bars + live updates)
+        // Streaming historical API delivers the initial batch then continues with live bar updates
+        // on the same subscription — chart backfill and live candles from a single API call.
         let client_hist = client.clone();
         let msg_tx_hist = msg_tx.clone();
         let symbol_hist = symbol.clone();
@@ -363,7 +376,8 @@ async fn subscription_manager(
                                     volume: bar.volume,
                                 };
 
-                                // Update cache: replace last bar if same timestamp, else append
+                                // IBKR sends repeated updates for the in-progress bar as trades occur;
+                                // same timestamp means the bar is still forming — update in place, don't duplicate.
                                 {
                                     let mut cache = bar_cache_hist.write().await;
                                     let bars =
@@ -399,7 +413,8 @@ async fn subscription_manager(
     }
 }
 
-/// Handles WebSocket upgrade at GET /ws; passes broadcast receiver and subscribe channel.
+/// Subscribes to the broadcast channel at upgrade time (before the socket loop starts) so no
+/// messages are missed between the HTTP upgrade and the first recv call.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -411,9 +426,8 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx, bar_cache, position_cache))
 }
 
-/// Bidirectional WebSocket handler:
-/// - Forwards ServerMessages from broadcast channel to client
-/// - Reads subscribe requests from client and forwards to subscription manager
+/// Single task handles both directions via `tokio::select!` so we detect client disconnect
+/// from either side and clean up immediately, rather than coordinating two separate tasks.
 async fn handle_socket(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<ServerMessage>,
@@ -421,7 +435,8 @@ async fn handle_socket(
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
 ) {
-    // Send cached positions to newly connected client.
+    // Broadcast receivers only see messages sent after they subscribe, so late-joining clients
+    // would have no positions without this eager send from the cache.
     {
         let cache = position_cache.read().await;
         for pos in cache.values() {
@@ -434,7 +449,8 @@ async fn handle_socket(
         }
     }
 
-    // Send cached bars to newly connected client.
+    // Same rationale as positions above — without this, late-joining clients would have no
+    // chart data until the next live bar update arrives.
     {
         let cache = bar_cache.read().await;
         for (symbol, bars) in cache.iter() {
