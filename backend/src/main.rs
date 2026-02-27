@@ -49,6 +49,20 @@ struct PositionData {
     account: String,
 }
 
+/// Per-contract settings that a future autotrader will check before placing trades.
+/// In-memory only for now; serde derives allow adding persistence later without
+/// changing the WebSocket protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContractConfig {
+    symbol: String,
+    autotrade: bool,
+    max_pos_size: u32,
+    min_pos_size: u32,
+    max_order_size: u32,
+    multiplier: f64,
+    lot_size: u32,
+}
+
 /// Single enum for all server→client messages so one broadcast channel carries everything.
 /// `serde(tag = "type")` emits a discriminator field so the frontend can route by message kind.
 #[derive(Clone, Debug, Serialize)]
@@ -72,6 +86,7 @@ enum ServerMessage {
         bar: BarData,
     },
     PositionUpdate(PositionData),
+    ContractConfig(ContractConfig),
 }
 
 /// IBKR rejects duplicate subscriptions and charges per active subscription, so we dedup
@@ -100,6 +115,7 @@ struct SubscribeRequest {
 enum ClientMessage {
     Subscribe(SubscribeRequest),
     RequestBars { symbol: String },
+    UpdateContractConfig(ContractConfig),
 }
 
 /// Caches use `Arc<RwLock<>>` because many WebSocket tasks read concurrently while only
@@ -110,6 +126,7 @@ struct AppState {
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
+    config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
 }
 
 #[tokio::main]
@@ -132,13 +149,18 @@ async fn main() -> Result<()> {
     let position_cache: Arc<RwLock<HashMap<String, PositionData>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Per-contract autotrader settings, cached so late-joining clients get current configs.
+    let config_cache: Arc<RwLock<HashMap<String, ContractConfig>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Runs in a dedicated task so the HTTP server can start accepting connections immediately.
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
     let position_cache_clone = position_cache.clone();
+    let config_cache_clone = config_cache.clone();
     let subscribe_tx_clone = subscribe_tx.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, subscribe_tx_clone, msg_tx_clone, bar_cache_clone, position_cache_clone)
+        subscription_manager(subscribe_rx, subscribe_tx_clone, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone)
             .await;
     });
 
@@ -147,6 +169,7 @@ async fn main() -> Result<()> {
         subscribe_tx,
         bar_cache,
         position_cache,
+        config_cache,
     };
 
     let app = Router::new()
@@ -168,6 +191,7 @@ async fn subscription_manager(
     msg_tx: broadcast::Sender<ServerMessage>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
+    config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -244,6 +268,25 @@ async fn subscription_manager(
                 req.symbol, req.security_type, req.exchange
             );
             continue;
+        }
+
+        // Create default config for newly subscribed contracts so the autotrader
+        // has safe defaults (disabled, zero sizes) until the user explicitly configures it.
+        {
+            let mut cache = config_cache.write().await;
+            if !cache.contains_key(&req.symbol) {
+                let cfg = ContractConfig {
+                    symbol: req.symbol.clone(),
+                    autotrade: false,
+                    max_pos_size: 0,
+                    min_pos_size: 0,
+                    max_order_size: 0,
+                    multiplier: 1.0,
+                    lot_size: 1,
+                };
+                cache.insert(req.symbol.clone(), cfg.clone());
+                let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
+            }
         }
 
         let contract = Contract {
@@ -420,10 +463,12 @@ async fn ws_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
     let rx = state.msg_tx.subscribe();
+    let msg_tx = state.msg_tx.clone();
     let subscribe_tx = state.subscribe_tx.clone();
     let bar_cache = state.bar_cache.clone();
     let position_cache = state.position_cache.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, subscribe_tx, bar_cache, position_cache))
+    let config_cache = state.config_cache.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, bar_cache, position_cache, config_cache))
 }
 
 /// Single task handles both directions via `tokio::select!` so we detect client disconnect
@@ -431,9 +476,11 @@ async fn ws_handler(
 async fn handle_socket(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<ServerMessage>,
+    msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
+    config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
 ) {
     // Broadcast receivers only see messages sent after they subscribe, so late-joining clients
     // would have no positions without this eager send from the cache.
@@ -458,6 +505,18 @@ async fn handle_socket(
                 symbol: symbol.clone(),
                 bars: bars.clone(),
             };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(Message::Text(json)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    {
+        let cache = config_cache.read().await;
+        for cfg in cache.values() {
+            let msg = ServerMessage::ContractConfig(cfg.clone());
             if let Ok(json) = serde_json::to_string(&msg) {
                 if socket.send(Message::Text(json)).await.is_err() {
                     return;
@@ -505,6 +564,11 @@ async fn handle_socket(
                                         }
                                     }
                                 }
+                            }
+                            Ok(ClientMessage::UpdateContractConfig(cfg)) => {
+                                info!("Config update for {}: autotrade={}", cfg.symbol, cfg.autotrade);
+                                config_cache.write().await.insert(cfg.symbol.clone(), cfg.clone());
+                                let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
                             }
                             Err(e) => {
                                 info!("Invalid client message: {e}");

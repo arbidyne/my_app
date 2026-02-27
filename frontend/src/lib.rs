@@ -38,6 +38,17 @@ struct PositionData {
     account: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct ContractConfig {
+    symbol: String,
+    autotrade: bool,
+    max_pos_size: u32,
+    min_pos_size: u32,
+    max_order_size: u32,
+    multiplier: f64,
+    lot_size: u32,
+}
+
 /// Tagged enum matching the backend's ServerMessage.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -46,6 +57,19 @@ enum ServerMessage {
     HistoricalBars { symbol: String, bars: Vec<BarData> },
     RealtimeBar { symbol: String, bar: BarData },
     PositionUpdate(PositionData),
+    ContractConfig(ContractConfig),
+}
+
+#[derive(Serialize)]
+struct UpdateContractConfigMsg {
+    r#type: String,
+    symbol: String,
+    autotrade: bool,
+    max_pos_size: u32,
+    min_pos_size: u32,
+    max_order_size: u32,
+    multiplier: f64,
+    lot_size: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -286,15 +310,39 @@ fn CandlestickChart(
     }
 }
 
+fn send_config_update(ws: &SendWrapper<Rc<RefCell<Option<WebSocket>>>>, cfg: &ContractConfig) {
+    let msg = UpdateContractConfigMsg {
+        r#type: "update_contract_config".to_string(),
+        symbol: cfg.symbol.clone(),
+        autotrade: cfg.autotrade,
+        max_pos_size: cfg.max_pos_size,
+        min_pos_size: cfg.min_pos_size,
+        max_order_size: cfg.max_order_size,
+        multiplier: cfg.multiplier,
+        lot_size: cfg.lot_size,
+    };
+    if let Ok(json) = serde_json::to_string(&msg) {
+        if let Some(ws) = ws.borrow().as_ref() {
+            let _ = ws.send_with_str(&json);
+        }
+    }
+}
+
 #[component]
 fn ContractRow(
     symbol: String,
     prices: RwSignal<HashMap<String, PriceUpdate>>,
     bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
     positions: RwSignal<HashMap<String, PositionData>>,
+    configs: RwSignal<HashMap<String, ContractConfig>>,
+    ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>>,
 ) -> impl IntoView {
     let sym_for_price = symbol.clone();
     let sym_for_chart = symbol.clone();
+    let sym_for_config = symbol.clone();
+
+    let label_style = "display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;";
+    let input_style = "width: 100%; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; box-sizing: border-box;";
 
     view! {
         <div style="display: flex; gap: 16px; align-items: flex-start;">
@@ -310,6 +358,159 @@ fn ContractRow(
                 <CandlestickChart symbol=sym_for_chart bar_history=bar_history />
             </div>
         </div>
+        // Config panel
+        {
+            let ws = ws_ref.clone();
+            let sym = sym_for_config.clone();
+            move || {
+                configs.get().get(&sym).cloned().map(|cfg| {
+                    let sym = sym.clone();
+                    let ws = ws.clone();
+
+                    let ws_at = ws.clone();
+                    let sym_at = sym.clone();
+                    let on_autotrade = move |e: web_sys::Event| {
+                        let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked();
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_at) {
+                                c.autotrade = checked;
+                                send_config_update(&ws_at, c);
+                            }
+                        });
+                    };
+
+                    let ws_mps = ws.clone();
+                    let sym_mps = sym.clone();
+                    let on_max_pos = move |e: web_sys::Event| {
+                        let val: u32 = event_target_value(&e).parse().unwrap_or(0);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_mps) {
+                                c.max_pos_size = val;
+                                send_config_update(&ws_mps, c);
+                            }
+                        });
+                    };
+
+                    let ws_mnps = ws.clone();
+                    let sym_mnps = sym.clone();
+                    let on_min_pos = move |e: web_sys::Event| {
+                        let val: u32 = event_target_value(&e).parse().unwrap_or(0);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_mnps) {
+                                c.min_pos_size = val;
+                                send_config_update(&ws_mnps, c);
+                            }
+                        });
+                    };
+
+                    let ws_mos = ws.clone();
+                    let sym_mos = sym.clone();
+                    let on_max_order = move |e: web_sys::Event| {
+                        let val: u32 = event_target_value(&e).parse().unwrap_or(0);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_mos) {
+                                c.max_order_size = val;
+                                send_config_update(&ws_mos, c);
+                            }
+                        });
+                    };
+
+                    let ws_mul = ws.clone();
+                    let sym_mul = sym.clone();
+                    let on_multiplier = move |e: web_sys::Event| {
+                        let val: f64 = event_target_value(&e).parse().unwrap_or(1.0);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_mul) {
+                                c.multiplier = val;
+                                send_config_update(&ws_mul, c);
+                            }
+                        });
+                    };
+
+                    let ws_ls = ws.clone();
+                    let sym_ls = sym.clone();
+                    let on_lot_size = move |e: web_sys::Event| {
+                        let val: u32 = event_target_value(&e).parse().unwrap_or(1);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_ls) {
+                                c.lot_size = val;
+                                send_config_update(&ws_ls, c);
+                            }
+                        });
+                    };
+
+                    view! {
+                        <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-top: 12px;">
+                            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                                <h4 style="margin: 0; font-size: 0.95em; color: #333;">"Config"</h4>
+                                <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9em;">
+                                    <input
+                                        type="checkbox"
+                                        prop:checked=cfg.autotrade
+                                        on:change=on_autotrade
+                                        style="width: 16px; height: 16px; cursor: pointer;"
+                                    />
+                                    "Autotrade"
+                                </label>
+                            </div>
+                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px;">
+                                <div>
+                                    <label style=label_style>"Max Pos Size"</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        prop:value=cfg.max_pos_size.to_string()
+                                        on:change=on_max_pos
+                                        style=input_style
+                                    />
+                                </div>
+                                <div>
+                                    <label style=label_style>"Min Pos Size"</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        prop:value=cfg.min_pos_size.to_string()
+                                        on:change=on_min_pos
+                                        style=input_style
+                                    />
+                                </div>
+                                <div>
+                                    <label style=label_style>"Max Order Size"</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        prop:value=cfg.max_order_size.to_string()
+                                        on:change=on_max_order
+                                        style=input_style
+                                    />
+                                </div>
+                                <div>
+                                    <label style=label_style>"Multiplier"</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.01"
+                                        prop:value=cfg.multiplier.to_string()
+                                        on:change=on_multiplier
+                                        style=input_style
+                                    />
+                                </div>
+                                <div>
+                                    <label style=label_style>"Lot Size"</label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        prop:value=cfg.lot_size.to_string()
+                                        on:change=on_lot_size
+                                        style=input_style
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -318,6 +519,7 @@ fn App() -> impl IntoView {
     let prices: RwSignal<HashMap<String, PriceUpdate>> = RwSignal::new(HashMap::new());
     let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
     let positions: RwSignal<HashMap<String, PositionData>> = RwSignal::new(HashMap::new());
+    let configs: RwSignal<HashMap<String, ContractConfig>> = RwSignal::new(HashMap::new());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -326,8 +528,10 @@ fn App() -> impl IntoView {
     let exchange_input = RwSignal::new("SMART".to_string());
     let currency_input = RwSignal::new("USD".to_string());
 
-    // Store WebSocket reference for sending messages
-    let ws_ref: Rc<RefCell<Option<WebSocket>>> = Rc::new(RefCell::new(None));
+    // Store WebSocket reference for sending messages.
+    // SendWrapper is safe because WASM is single-threaded; it satisfies the Send bound
+    // that Leptos reactive closures require.
+    let ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>> = SendWrapper::new(Rc::new(RefCell::new(None)));
 
     // Open WebSocket inside an effect so it runs once on mount.
     let ws_ref_clone = ws_ref.clone();
@@ -382,6 +586,11 @@ fn App() -> impl IntoView {
                     Ok(ServerMessage::PositionUpdate(pos)) => {
                         positions.update(|map| {
                             map.insert(pos.symbol.clone(), pos);
+                        });
+                    }
+                    Ok(ServerMessage::ContractConfig(cfg)) => {
+                        configs.update(|map| {
+                            map.insert(cfg.symbol.clone(), cfg);
                         });
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
@@ -552,17 +761,21 @@ fn App() -> impl IntoView {
                     }
                         .into_any()
                 } else {
+                    let ws_ref_rows = ws_ref.clone();
                     view! {
                         <div style="display: flex; flex-direction: column; gap: 16px;">
                             {symbols
                                 .into_iter()
                                 .map(|symbol| {
+                                    let ws = ws_ref_rows.clone();
                                     view! {
                                         <ContractRow
                                             symbol=symbol
                                             prices=prices
                                             bar_history=bar_history
                                             positions=positions
+                                            configs=configs
+                                            ws_ref=ws
                                         />
                                     }
                                 })
