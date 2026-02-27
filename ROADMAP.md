@@ -5,7 +5,7 @@
 - ~~**Order lifecycle tracking** — open/filled/cancelled/rejected states, displayed in UI~~ **DONE**
 - ~~**Order lifecycle state machine** — validated state transitions, race condition handling (fill during cancel/amend), IBKR event mapping, terminal state enforcement~~ **DONE**
 - **Order modification/cancellation** — modify price/quantity of working orders
-- **Basic execution logging** — persist order history for audit
+- **UUID tracking for each order** — Every order request should be given a UUID by frontend.  All messages sent back to the frontend relating to that order should have that UUID in them.  This includes Order Insert Reply, Trade feeds, Amend replies etc.  This means a frontend can send an order to backend, and then send a cancel or modify order BEFORE the backend has replied with the IB order id. 
 
 ## Phase 2 — Risk Management
 - **Pre-trade risk checks** — enforce max_pos_size, max_order_size, min_pos_size before submitting

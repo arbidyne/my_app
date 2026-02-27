@@ -128,6 +128,21 @@ struct PlaceOrderMsg {
     time_in_force: String,
 }
 
+#[derive(Serialize)]
+struct CancelOrderMsg {
+    r#type: String,
+    order_id: i32,
+}
+
+#[derive(Serialize)]
+struct ModifyOrderMsg {
+    r#type: String,
+    order_id: i32,
+    quantity: f64,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+}
+
 // ---------------------------------------------------------------------------
 // ApexCharts JS interop helpers
 // ---------------------------------------------------------------------------
@@ -693,6 +708,11 @@ fn ContractRow(
         // Active orders for this contract
         {
             let sym = sym_for_orders;
+            let ws_orders = ws_ref;
+            let editing_order_id: RwSignal<Option<i32>> = RwSignal::new(None);
+            let edit_qty = RwSignal::new(String::new());
+            let edit_price = RwSignal::new(String::new());
+
             move || {
                 let all = orders.get();
                 let mut contract_orders: Vec<_> = all.values()
@@ -703,6 +723,7 @@ fn ContractRow(
                 if contract_orders.is_empty() {
                     view! { <div></div> }.into_any()
                 } else {
+                    let ws = ws_orders.clone();
                     view! {
                         <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-top: 12px;">
                             <h4 style="margin: 0 0 8px 0; font-size: 0.95em; color: #333;">"Orders"</h4>
@@ -717,6 +738,7 @@ fn ContractRow(
                                         <th style="padding: 4px 8px;">"Status"</th>
                                         <th style="padding: 4px 8px;">"Filled"</th>
                                         <th style="padding: 4px 8px;">"Avg Fill"</th>
+                                        <th style="padding: 4px 8px;">"Actions"</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -729,23 +751,167 @@ fn ContractRow(
                                             "Working" | "PartiallyFilled" => "#ca8a04",
                                             _ => "#ca8a04",
                                         };
-                                        let price_display = match o.order_type.as_str() {
+                                        let status_style = format!("padding: 4px 8px; color: {status_color}; font-weight: 600;");
+                                        let avg_fill = if o.average_fill_price > 0.0 { format!("{:.2}", o.average_fill_price) } else { "\u{2014}".to_string() };
+
+                                        let can_cancel = matches!(o.status.as_str(), "Working" | "PartiallyFilled" | "PendingAck");
+                                        let can_modify = matches!(o.status.as_str(), "Working" | "PartiallyFilled")
+                                            && matches!(o.order_type.as_str(), "LMT" | "STP");
+
+                                        let is_editing = editing_order_id.get() == Some(o.order_id);
+
+                                        // Qty cell: show input when editing, text otherwise
+                                        let qty_display = if is_editing {
+                                            view! {
+                                                <td style="padding: 4px 8px;">
+                                                    <input
+                                                        type="number"
+                                                        min="1"
+                                                        step="1"
+                                                        prop:value=move || edit_qty.get()
+                                                        on:input=move |e| edit_qty.set(event_target_value(&e))
+                                                        style="width: 60px; padding: 2px 4px; border: 1px solid #93c5fd; border-radius: 4px; font-size: 0.95em;"
+                                                    />
+                                                </td>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <td style="padding: 4px 8px;">{format!("{:.0}", o.quantity)}</td>
+                                            }.into_any()
+                                        };
+
+                                        // Price cell: show input when editing, text otherwise
+                                        let price_val = match o.order_type.as_str() {
                                             "LMT" => o.limit_price.map(|p| format!("{p:.2}")).unwrap_or_default(),
                                             "STP" => o.stop_price.map(|p| format!("{p:.2}")).unwrap_or_default(),
                                             _ => "MKT".to_string(),
                                         };
-                                        let status_style = format!("padding: 4px 8px; color: {status_color}; font-weight: 600;");
-                                        let avg_fill = if o.average_fill_price > 0.0 { format!("{:.2}", o.average_fill_price) } else { "\u{2014}".to_string() };
+                                        let price_display = if is_editing {
+                                            view! {
+                                                <td style="padding: 4px 8px;">
+                                                    <input
+                                                        type="number"
+                                                        step="0.01"
+                                                        prop:value=move || edit_price.get()
+                                                        on:input=move |e| edit_price.set(event_target_value(&e))
+                                                        style="width: 80px; padding: 2px 4px; border: 1px solid #93c5fd; border-radius: 4px; font-size: 0.95em;"
+                                                    />
+                                                </td>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <td style="padding: 4px 8px;">{price_val}</td>
+                                            }.into_any()
+                                        };
+
+                                        // Actions cell
+                                        let oid = o.order_id;
+                                        let o_type = o.order_type.clone();
+                                        let o_qty = o.quantity;
+                                        let o_lp = o.limit_price;
+                                        let o_sp = o.stop_price;
+                                        let ws_cancel = ws.clone();
+                                        let ws_save = ws.clone();
+                                        let actions = if is_editing {
+                                            // Editing mode: Save + X buttons
+                                            let o_type_save = o_type.clone();
+                                            let on_save = move |_| {
+                                                let qty: f64 = edit_qty.get().parse().unwrap_or(o_qty);
+                                                let price: Option<f64> = edit_price.get().parse().ok();
+                                                let (lp, sp) = match o_type_save.as_str() {
+                                                    "LMT" => (price, None),
+                                                    "STP" => (None, price),
+                                                    _ => (None, None),
+                                                };
+                                                let msg = ModifyOrderMsg {
+                                                    r#type: "modify_order".to_string(),
+                                                    order_id: oid,
+                                                    quantity: qty,
+                                                    limit_price: lp,
+                                                    stop_price: sp,
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&msg) {
+                                                    if let Some(ws) = ws_save.borrow().as_ref() {
+                                                        let _ = ws.send_with_str(&json);
+                                                    }
+                                                }
+                                                editing_order_id.set(None);
+                                            };
+                                            let on_discard = move |_| {
+                                                editing_order_id.set(None);
+                                            };
+                                            view! {
+                                                <td style="padding: 4px 8px; white-space: nowrap;">
+                                                    <button
+                                                        on:click=on_save
+                                                        style="padding: 2px 8px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85em; margin-right: 4px;"
+                                                    >"Save"</button>
+                                                    <button
+                                                        on:click=on_discard
+                                                        style="padding: 2px 8px; background: #6b7280; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85em;"
+                                                    >"X"</button>
+                                                </td>
+                                            }.into_any()
+                                        } else {
+                                            // Normal mode: Cancel + Modify buttons
+                                            let on_cancel = move |_| {
+                                                let msg = CancelOrderMsg {
+                                                    r#type: "cancel_order".to_string(),
+                                                    order_id: oid,
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&msg) {
+                                                    if let Some(ws) = ws_cancel.borrow().as_ref() {
+                                                        let _ = ws.send_with_str(&json);
+                                                    }
+                                                }
+                                            };
+                                            let on_modify = move |_| {
+                                                edit_qty.set(format!("{:.0}", o_qty));
+                                                let price_str = match o_type.as_str() {
+                                                    "LMT" => o_lp.map(|p| format!("{p:.2}")).unwrap_or_default(),
+                                                    "STP" => o_sp.map(|p| format!("{p:.2}")).unwrap_or_default(),
+                                                    _ => String::new(),
+                                                };
+                                                edit_price.set(price_str);
+                                                editing_order_id.set(Some(oid));
+                                            };
+                                            view! {
+                                                <td style="padding: 4px 8px; white-space: nowrap;">
+                                                    {if can_cancel {
+                                                        Some(view! {
+                                                            <button
+                                                                on:click=on_cancel
+                                                                style="padding: 2px 8px; background: none; color: #dc2626; border: 1px solid #dc2626; border-radius: 4px; cursor: pointer; font-size: 0.85em; margin-right: 4px;"
+                                                            >"Cancel"</button>
+                                                        })
+                                                    } else {
+                                                        None
+                                                    }}
+                                                    {if can_modify {
+                                                        Some(view! {
+                                                            <button
+                                                                on:click=on_modify
+                                                                style="padding: 2px 8px; background: none; color: #2563eb; border: 1px solid #2563eb; border-radius: 4px; cursor: pointer; font-size: 0.85em;"
+                                                            >"Modify"</button>
+                                                        })
+                                                    } else {
+                                                        None
+                                                    }}
+                                                </td>
+                                            }.into_any()
+                                        };
+
                                         view! {
                                             <tr style="border-bottom: 1px solid #f3f4f6;">
                                                 <td style="padding: 4px 8px;">{o.order_id}</td>
                                                 <td style="padding: 4px 8px; font-weight: 600;">{o.action.clone()}</td>
                                                 <td style="padding: 4px 8px;">{o.order_type.clone()}</td>
-                                                <td style="padding: 4px 8px;">{format!("{:.0}", o.quantity)}</td>
-                                                <td style="padding: 4px 8px;">{price_display}</td>
+                                                {qty_display}
+                                                {price_display}
                                                 <td style=status_style>{o.status.clone()}</td>
                                                 <td style="padding: 4px 8px;">{format!("{:.0}", o.filled)}</td>
                                                 <td style="padding: 4px 8px;">{avg_fill}</td>
+                                                {actions}
                                             </tr>
                                         }
                                     }).collect::<Vec<_>>()}

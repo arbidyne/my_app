@@ -6,7 +6,9 @@
 //! (e.g. fills arriving while a cancel is pending), and logs state changes via
 //! `tracing`.
 
-use ibapi::orders::{OrderStatus as IbOrderStatus, PlaceOrder as IbPlaceOrder};
+use ibapi::orders::{
+    CancelOrder as IbCancelOrder, OrderStatus as IbOrderStatus, PlaceOrder as IbPlaceOrder,
+};
 use tracing::{debug, error, info, warn};
 
 /// Every state an order can occupy. Terminal states ([`Filled`], [`Cancelled`],
@@ -40,7 +42,7 @@ impl OrderState {
         }
     }
 
-    fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Filled | Self::Cancelled | Self::Rejected { .. })
     }
 }
@@ -144,7 +146,7 @@ impl OrderStateMachine {
 
     fn on_ack_valid(&mut self) -> Result<(), String> {
         match self.state {
-            OrderState::PendingAck => {
+            OrderState::PendingAck | OrderState::AmendPending => {
                 self.transition(OrderState::Working);
                 Ok(())
             }
@@ -375,7 +377,22 @@ pub fn map_ibkr_to_event(event: &IbPlaceOrder) -> Option<OrderEvent> {
     }
 }
 
-fn map_status(
+/// Maps an IBKR [`CancelOrder`] callback into an [`OrderEvent`], or `None`
+/// for notice messages (logged by the caller).
+pub fn map_cancel_order_to_event(event: &IbCancelOrder) -> Option<OrderEvent> {
+    match event {
+        IbCancelOrder::OrderStatus(IbOrderStatus {
+            status,
+            filled,
+            remaining,
+            average_fill_price,
+            ..
+        }) => map_status(status, *filled, *remaining, *average_fill_price),
+        IbCancelOrder::Notice(_) => None,
+    }
+}
+
+pub(crate) fn map_status(
     status: &str,
     filled: f64,
     remaining: f64,
@@ -717,6 +734,49 @@ mod tests {
         let event = IbPlaceOrder::OrderStatus(status);
         let mapped = map_ibkr_to_event(&event).unwrap();
         assert!(matches!(mapped, OrderEvent::CancelConfirmed));
+    }
+
+    #[test]
+    fn amend_pending_then_ack_valid() {
+        let mut m = working(13, 100.0);
+        m.apply(OrderEvent::AmendRequested).unwrap();
+        assert_eq!(m.state.as_str(), "AmendPending");
+
+        // After a modify (place_order with same ID), IBKR sends "Submitted" → AckValid.
+        m.apply(OrderEvent::AckValid).unwrap();
+        assert_eq!(m.state.as_str(), "Working");
+    }
+
+    #[test]
+    fn map_cancel_order_status() {
+        let status = IbOrderStatus {
+            order_id: 1,
+            status: "Cancelled".to_string(),
+            filled: 0.0,
+            remaining: 100.0,
+            average_fill_price: 0.0,
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: 0.0,
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: 0.0,
+        };
+        let event = IbCancelOrder::OrderStatus(status);
+        let mapped = map_cancel_order_to_event(&event).unwrap();
+        assert!(matches!(mapped, OrderEvent::CancelConfirmed));
+    }
+
+    #[test]
+    fn map_cancel_order_notice() {
+        use ibapi::messages::Notice;
+        let notice = Notice {
+            code: 202,
+            message: "Order Canceled - reason:".to_string(),
+            error_time: None,
+        };
+        let event = IbCancelOrder::Notice(notice);
+        assert!(map_cancel_order_to_event(&event).is_none());
     }
 
     #[test]
