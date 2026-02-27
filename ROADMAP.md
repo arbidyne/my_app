@@ -1,9 +1,8 @@
 # Roadmap: NautilusTrader-inspired features
 
 ## Phase 1 — Order Execution
-- **Order submission** — Market, Limit, Stop orders via IBKR API
-- **Order lifecycle tracking** — open/filled/cancelled/rejected states, displayed in UI
-- **Position close** — one-click close from the UI
+- ~~**Order submission** — Market, Limit, Stop orders via IBKR API~~ **DONE**
+- ~~**Order lifecycle tracking** — open/filled/cancelled/rejected states, displayed in UI~~ **DONE**
 - **Order modification/cancellation** — modify price/quantity of working orders
 - **Basic execution logging** — persist order history for audit
 
