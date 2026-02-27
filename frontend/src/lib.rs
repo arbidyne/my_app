@@ -58,6 +58,7 @@ enum ServerMessage {
     RealtimeBar { symbol: String, bar: BarData },
     PositionUpdate(PositionData),
     ContractConfig(ContractConfig),
+    OrderUpdate(OrderUpdate),
 }
 
 #[derive(Serialize)]
@@ -90,6 +91,41 @@ struct SubscribeRequest {
 struct RequestBarsMsg {
     r#type: String,
     symbol: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct OrderUpdate {
+    order_id: i32,
+    symbol: String,
+    action: String,
+    order_type: String,
+    quantity: f64,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+    status: String,
+    filled: f64,
+    remaining: f64,
+    average_fill_price: f64,
+}
+
+#[derive(Serialize)]
+struct PlaceOrderMsg {
+    r#type: String,
+    symbol: String,
+    security_type: String,
+    exchange: String,
+    currency: String,
+    primary_exchange: String,
+    last_trade_date_or_contract_month: String,
+    strike: f64,
+    right: String,
+    contract_id: i32,
+    action: String,
+    order_type: String,
+    quantity: f64,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+    time_in_force: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +376,13 @@ fn ContractRow(
     bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
     positions: RwSignal<HashMap<String, PositionData>>,
     configs: RwSignal<HashMap<String, ContractConfig>>,
+    orders: RwSignal<HashMap<i32, OrderUpdate>>,
     ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>>,
 ) -> impl IntoView {
     let sym_for_price = symbol.clone();
     let sym_for_chart = symbol.clone();
     let sym_for_config = symbol.clone();
+    let sym_for_orders = symbol.clone();
 
     let label_style = "display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;";
     let input_style = "width: 100%; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; box-sizing: border-box;";
@@ -515,6 +553,207 @@ fn ContractRow(
                 })
             }
         }
+        // Order entry panel
+        {
+            let ws = ws_ref.clone();
+            let sym = symbol.clone();
+            let order_action = RwSignal::new("BUY".to_string());
+            let order_type = RwSignal::new("MKT".to_string());
+            let order_qty = RwSignal::new("1".to_string());
+            let order_limit = RwSignal::new(String::new());
+            let order_stop = RwSignal::new(String::new());
+            let order_tif = RwSignal::new("DAY".to_string());
+
+            let ws_submit = ws.clone();
+            let sym_submit = sym.clone();
+            let on_submit_order = move |_| {
+                let qty: f64 = order_qty.get().parse().unwrap_or(0.0);
+                if qty <= 0.0 { return; }
+                let ot = order_type.get();
+                let lp = order_limit.get().parse::<f64>().ok();
+                let sp = order_stop.get().parse::<f64>().ok();
+
+                // Look up contract details from the subscription's price data
+                // We need the contract fields — for now use reasonable defaults
+                // matching the subscription form. The configs store the symbol.
+                let price_data = prices.get();
+                let _ = price_data.get(&sym_submit);
+
+                // Get contract details from the config/subscription context.
+                // We send the symbol and let the backend match the subscribed contract.
+                let msg = PlaceOrderMsg {
+                    r#type: "place_order".to_string(),
+                    symbol: sym_submit.clone(),
+                    security_type: String::new(),
+                    exchange: String::new(),
+                    currency: String::new(),
+                    primary_exchange: String::new(),
+                    last_trade_date_or_contract_month: String::new(),
+                    strike: 0.0,
+                    right: String::new(),
+                    contract_id: 0,
+                    action: order_action.get(),
+                    order_type: ot,
+                    quantity: qty,
+                    limit_price: lp,
+                    stop_price: sp,
+                    time_in_force: order_tif.get(),
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if let Some(ws) = ws_submit.borrow().as_ref() {
+                        let _ = ws.send_with_str(&json);
+                    }
+                }
+            };
+
+            view! {
+                <div style="background: #f0f4ff; border: 1px solid #c7d2fe; border-radius: 12px; padding: 16px; margin-top: 12px;">
+                    <h4 style="margin: 0 0 12px 0; font-size: 0.95em; color: #333;">"Order Entry"</h4>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: end;">
+                        <div>
+                            <label style=label_style>"Action"</label>
+                            <select
+                                prop:value=move || order_action.get()
+                                on:change=move |e| order_action.set(event_target_value(&e))
+                                style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; background: #fff;"
+                            >
+                                <option value="BUY">"BUY"</option>
+                                <option value="SELL">"SELL"</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style=label_style>"Type"</label>
+                            <select
+                                prop:value=move || order_type.get()
+                                on:change=move |e| order_type.set(event_target_value(&e))
+                                style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; background: #fff;"
+                            >
+                                <option value="MKT">"MKT"</option>
+                                <option value="LMT">"LMT"</option>
+                                <option value="STP">"STP"</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style=label_style>"Quantity"</label>
+                            <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                prop:value=move || order_qty.get()
+                                on:input=move |e| order_qty.set(event_target_value(&e))
+                                style="width: 80px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; box-sizing: border-box;"
+                            />
+                        </div>
+                        <div>
+                            <label style=label_style>"Limit Price"</label>
+                            <input
+                                type="number"
+                                step="0.01"
+                                placeholder="—"
+                                prop:value=move || order_limit.get()
+                                on:input=move |e| order_limit.set(event_target_value(&e))
+                                disabled=move || order_type.get() != "LMT"
+                                style="width: 100px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; box-sizing: border-box;"
+                            />
+                        </div>
+                        <div>
+                            <label style=label_style>"Stop Price"</label>
+                            <input
+                                type="number"
+                                step="0.01"
+                                placeholder="—"
+                                prop:value=move || order_stop.get()
+                                on:input=move |e| order_stop.set(event_target_value(&e))
+                                disabled=move || order_type.get() != "STP"
+                                style="width: 100px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; box-sizing: border-box;"
+                            />
+                        </div>
+                        <div>
+                            <label style=label_style>"TIF"</label>
+                            <select
+                                prop:value=move || order_tif.get()
+                                on:change=move |e| order_tif.set(event_target_value(&e))
+                                style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; background: #fff;"
+                            >
+                                <option value="DAY">"DAY"</option>
+                                <option value="GTC">"GTC"</option>
+                                <option value="IOC">"IOC"</option>
+                            </select>
+                        </div>
+                        <button
+                            on:click=on_submit_order
+                            style="padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer;"
+                        >
+                            "Submit Order"
+                        </button>
+                    </div>
+                </div>
+            }
+        }
+        // Active orders for this contract
+        {
+            let sym = sym_for_orders;
+            move || {
+                let all = orders.get();
+                let mut contract_orders: Vec<_> = all.values()
+                    .filter(|o| o.symbol == sym)
+                    .cloned()
+                    .collect();
+                contract_orders.sort_by(|a, b| b.order_id.cmp(&a.order_id));
+                if contract_orders.is_empty() {
+                    view! { <div></div> }.into_any()
+                } else {
+                    view! {
+                        <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-top: 12px;">
+                            <h4 style="margin: 0 0 8px 0; font-size: 0.95em; color: #333;">"Orders"</h4>
+                            <table style="width: 100%; font-size: 0.85em; border-collapse: collapse;">
+                                <thead>
+                                    <tr style="text-align: left; color: #888; border-bottom: 1px solid #e5e7eb;">
+                                        <th style="padding: 4px 8px;">"ID"</th>
+                                        <th style="padding: 4px 8px;">"Action"</th>
+                                        <th style="padding: 4px 8px;">"Type"</th>
+                                        <th style="padding: 4px 8px;">"Qty"</th>
+                                        <th style="padding: 4px 8px;">"Price"</th>
+                                        <th style="padding: 4px 8px;">"Status"</th>
+                                        <th style="padding: 4px 8px;">"Filled"</th>
+                                        <th style="padding: 4px 8px;">"Avg Fill"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {contract_orders.into_iter().map(|o| {
+                                        let status_color = match o.status.as_str() {
+                                            "Filled" => "#16a34a",
+                                            "Cancelled" | "ApiCancelled" | "Inactive" => "#dc2626",
+                                            s if s.starts_with("Error") => "#dc2626",
+                                            _ => "#ca8a04",
+                                        };
+                                        let price_display = match o.order_type.as_str() {
+                                            "LMT" => o.limit_price.map(|p| format!("{p:.2}")).unwrap_or_default(),
+                                            "STP" => o.stop_price.map(|p| format!("{p:.2}")).unwrap_or_default(),
+                                            _ => "MKT".to_string(),
+                                        };
+                                        let status_style = format!("padding: 4px 8px; color: {status_color}; font-weight: 600;");
+                                        let avg_fill = if o.average_fill_price > 0.0 { format!("{:.2}", o.average_fill_price) } else { "\u{2014}".to_string() };
+                                        view! {
+                                            <tr style="border-bottom: 1px solid #f3f4f6;">
+                                                <td style="padding: 4px 8px;">{o.order_id}</td>
+                                                <td style="padding: 4px 8px; font-weight: 600;">{o.action.clone()}</td>
+                                                <td style="padding: 4px 8px;">{o.order_type.clone()}</td>
+                                                <td style="padding: 4px 8px;">{format!("{:.0}", o.quantity)}</td>
+                                                <td style="padding: 4px 8px;">{price_display}</td>
+                                                <td style=status_style>{o.status.clone()}</td>
+                                                <td style="padding: 4px 8px;">{format!("{:.0}", o.filled)}</td>
+                                                <td style="padding: 4px 8px;">{avg_fill}</td>
+                                            </tr>
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </tbody>
+                            </table>
+                        </div>
+                    }.into_any()
+                }
+            }
+        }
     }
 }
 
@@ -524,6 +763,7 @@ fn App() -> impl IntoView {
     let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
     let positions: RwSignal<HashMap<String, PositionData>> = RwSignal::new(HashMap::new());
     let configs: RwSignal<HashMap<String, ContractConfig>> = RwSignal::new(HashMap::new());
+    let orders: RwSignal<HashMap<i32, OrderUpdate>> = RwSignal::new(HashMap::new());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -600,6 +840,11 @@ fn App() -> impl IntoView {
                     Ok(ServerMessage::ContractConfig(cfg)) => {
                         configs.update(|map| {
                             map.insert(cfg.symbol.clone(), cfg);
+                        });
+                    }
+                    Ok(ServerMessage::OrderUpdate(update)) => {
+                        orders.update(|map| {
+                            map.insert(update.order_id, update);
                         });
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
@@ -894,6 +1139,7 @@ fn App() -> impl IntoView {
                                             bar_history=bar_history
                                             positions=positions
                                             configs=configs
+                                            orders=orders
                                             ws_ref=ws
                                         />
                                     }

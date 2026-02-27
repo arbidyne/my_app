@@ -21,6 +21,7 @@ use ibapi::accounts::PositionUpdate as IbPositionUpdate;
 use ibapi::contracts::Contract;
 use ibapi::market_data::historical::HistoricalBarUpdate;
 use ibapi::market_data::realtime::BidAsk;
+use ibapi::orders::{Action, OrderBuilder, OrderStatus as IbOrderStatus, PlaceOrder as IbPlaceOrder};
 use ibapi::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -63,6 +64,50 @@ struct ContractConfig {
     lot_size: u32,
 }
 
+/// Client-submitted order with contract identification and order parameters.
+#[derive(Clone, Debug, Deserialize)]
+struct OrderRequest {
+    symbol: String,
+    security_type: String,
+    exchange: String,
+    currency: String,
+    #[serde(default)]
+    primary_exchange: String,
+    #[serde(default)]
+    last_trade_date_or_contract_month: String,
+    #[serde(default)]
+    strike: f64,
+    #[serde(default)]
+    right: String,
+    #[serde(default)]
+    contract_id: i32,
+    action: String,     // "BUY" or "SELL"
+    order_type: String, // "MKT", "LMT", "STP"
+    quantity: f64,
+    #[serde(default)]
+    limit_price: Option<f64>,
+    #[serde(default)]
+    stop_price: Option<f64>,
+    #[serde(default)]
+    time_in_force: String, // "DAY", "GTC", "IOC" — defaults to DAY
+}
+
+/// Tracks order lifecycle from submission through fill/cancel.
+#[derive(Clone, Debug, Serialize)]
+struct OrderUpdate {
+    order_id: i32,
+    symbol: String,
+    action: String,
+    order_type: String,
+    quantity: f64,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+    status: String,
+    filled: f64,
+    remaining: f64,
+    average_fill_price: f64,
+}
+
 /// Single enum for all server→client messages so one broadcast channel carries everything.
 /// `serde(tag = "type")` emits a discriminator field so the frontend can route by message kind.
 #[derive(Clone, Debug, Serialize)]
@@ -87,6 +132,7 @@ enum ServerMessage {
     },
     PositionUpdate(PositionData),
     ContractConfig(ContractConfig),
+    OrderUpdate(OrderUpdate),
 }
 
 /// IBKR rejects duplicate subscriptions and charges per active subscription, so we dedup
@@ -132,6 +178,7 @@ enum ClientMessage {
     Subscribe(SubscribeRequest),
     RequestBars { symbol: String },
     UpdateContractConfig(ContractConfig),
+    PlaceOrder(OrderRequest),
 }
 
 /// Caches use `Arc<RwLock<>>` because many WebSocket tasks read concurrently while only
@@ -140,9 +187,11 @@ enum ClientMessage {
 struct AppState {
     msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
+    order_tx: mpsc::Sender<OrderRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
+    order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
 }
 
 #[tokio::main]
@@ -157,6 +206,9 @@ async fn main() -> Result<()> {
     // Funneled through mpsc so a single manager task can dedup and prevent duplicate IBKR subscriptions.
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<SubscribeRequest>(32);
 
+    // Order requests funneled to the subscription manager where the ibapi Client lives.
+    let (order_tx, order_rx) = mpsc::channel::<OrderRequest>(32);
+
     // Cached server-side so clients connecting after the initial broadcast still get full bar history.
     let bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -169,23 +221,35 @@ async fn main() -> Result<()> {
     let config_cache: Arc<RwLock<HashMap<String, ContractConfig>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Cached so late-joining clients see active/recent orders.
+    let order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    // Maps symbol → Contract so order submission can look up contract details.
+    let contract_cache: Arc<RwLock<HashMap<String, Contract>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Runs in a dedicated task so the HTTP server can start accepting connections immediately.
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
     let position_cache_clone = position_cache.clone();
     let config_cache_clone = config_cache.clone();
+    let order_cache_clone = order_cache.clone();
+    let contract_cache_clone = contract_cache.clone();
     let subscribe_tx_clone = subscribe_tx.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, subscribe_tx_clone, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone)
+        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone)
             .await;
     });
 
     let state = AppState {
         msg_tx,
         subscribe_tx,
+        order_tx,
         bar_cache,
         position_cache,
         config_cache,
+        order_cache,
     };
 
     let app = Router::new()
@@ -204,10 +268,13 @@ async fn main() -> Result<()> {
 async fn subscription_manager(
     mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
+    mut order_rx: mpsc::Receiver<OrderRequest>,
     msg_tx: broadcast::Sender<ServerMessage>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
+    order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
+    contract_cache: Arc<RwLock<HashMap<String, Contract>>>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -275,213 +342,375 @@ async fn subscription_manager(
 
     let mut subscribed: HashSet<ContractKey> = HashSet::new();
 
-    while let Some(req) = subscribe_rx.recv().await {
-        let key = ContractKey {
-            symbol: req.symbol.clone(),
-            security_type: req.security_type.clone(),
-            exchange: req.exchange.clone(),
-            currency: req.currency.clone(),
-            last_trade_date_or_contract_month: req.last_trade_date_or_contract_month.clone(),
-            strike: req.strike.to_string(),
-            right: req.right.clone(),
-            contract_id: req.contract_id,
-        };
-
-        if !subscribed.insert(key) {
-            info!(
-                "Already subscribed to {} ({}) on {}",
-                req.symbol, req.security_type, req.exchange
-            );
-            continue;
-        }
-
-        // Create default config for newly subscribed contracts so the autotrader
-        // has safe defaults (disabled, zero sizes) until the user explicitly configures it.
-        {
-            let mut cache = config_cache.write().await;
-            if !cache.contains_key(&req.symbol) {
-                let cfg = ContractConfig {
+    loop {
+        tokio::select! {
+            Some(req) = subscribe_rx.recv() => {
+                let key = ContractKey {
                     symbol: req.symbol.clone(),
-                    autotrade: false,
-                    max_pos_size: 0,
-                    min_pos_size: 0i32,
-                    max_order_size: 0,
-                    multiplier: 1.0,
-                    lot_size: 1,
+                    security_type: req.security_type.clone(),
+                    exchange: req.exchange.clone(),
+                    currency: req.currency.clone(),
+                    last_trade_date_or_contract_month: req.last_trade_date_or_contract_month.clone(),
+                    strike: req.strike.to_string(),
+                    right: req.right.clone(),
+                    contract_id: req.contract_id,
                 };
-                cache.insert(req.symbol.clone(), cfg.clone());
-                let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
-            }
-        }
 
-        let contract = Contract {
-            contract_id: req.contract_id,
-            symbol: Symbol(req.symbol.clone()),
-            security_type: SecurityType::from(req.security_type.as_str()),
-            exchange: Exchange(req.exchange),
-            currency: Currency(req.currency),
-            primary_exchange: Exchange(req.primary_exchange),
-            last_trade_date_or_contract_month: req.last_trade_date_or_contract_month,
-            strike: req.strike,
-            right: req.right,
-            ..Default::default()
-        };
-        let symbol = req.symbol.clone();
+                if !subscribed.insert(key) {
+                    info!(
+                        "Already subscribed to {} ({}) on {}",
+                        req.symbol, req.security_type, req.exchange
+                    );
+                    continue;
+                }
 
-        // Tick-by-tick streaming (not snapshot polling) to minimize latency and API rate limit usage.
-        let client_tick = client.clone();
-        let msg_tx_tick = msg_tx.clone();
-        let symbol_tick = symbol.clone();
-        let contract_tick = contract.clone();
-        tokio::spawn(async move {
-            match client_tick
-                .tick_by_tick_bid_ask(&contract_tick, 0, false)
-                .await
-            {
-                Ok(mut subscription) => {
-                    info!("Subscribed to tick-by-tick bid/ask for {symbol_tick}");
-
-                    while let Some(tick_result) = subscription.next().await {
-                        match tick_result {
-                            Ok(BidAsk {
-                                time,
-                                bid_price,
-                                ask_price,
-                                bid_size,
-                                ask_size,
-                                ..
-                            }) => {
-                                let timestamp_ms = time.unix_timestamp() as u64 * 1000;
-                                // Mid-price when both sides are quoted; fall back to whichever
-                                // side exists (pre/post-market often has only one side).
-                                let last_price = if bid_price > 0.0 && ask_price > 0.0 {
-                                    (bid_price + ask_price) / 2.0
-                                } else if ask_price > 0.0 {
-                                    ask_price
-                                } else {
-                                    bid_price
-                                };
-
-                                let msg = ServerMessage::PriceUpdate {
-                                    symbol: symbol_tick.clone(),
-                                    last_price,
-                                    timestamp: timestamp_ms,
-                                    best_bid_price: bid_price,
-                                    best_bid_size: bid_size,
-                                    best_ask_price: ask_price,
-                                    best_ask_size: ask_size,
-                                };
-
-                                let _ = msg_tx_tick.send(msg);
-                                debug!(
-                                    "{symbol_tick} tick: bid {bid_price} x {bid_size} | ask {ask_price} x {ask_size} @ {timestamp_ms}"
-                                );
-                            }
-                            Err(e) => {
-                                error!("{symbol_tick} tick subscription error: {e}");
-                                break;
-                            }
-                        }
+                // Create default config for newly subscribed contracts so the autotrader
+                // has safe defaults (disabled, zero sizes) until the user explicitly configures it.
+                {
+                    let mut cache = config_cache.write().await;
+                    if !cache.contains_key(&req.symbol) {
+                        let cfg = ContractConfig {
+                            symbol: req.symbol.clone(),
+                            autotrade: false,
+                            max_pos_size: 0,
+                            min_pos_size: 0i32,
+                            max_order_size: 0,
+                            multiplier: 1.0,
+                            lot_size: 1,
+                        };
+                        cache.insert(req.symbol.clone(), cfg.clone());
+                        let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
                     }
                 }
-                Err(e) => {
-                    error!("Failed to subscribe to tick data for {symbol_tick}: {e}");
-                }
-            }
-        });
 
-        // Streaming historical API delivers the initial batch then continues with live bar updates
-        // on the same subscription — chart backfill and live candles from a single API call.
-        let client_hist = client.clone();
-        let msg_tx_hist = msg_tx.clone();
-        let symbol_hist = symbol.clone();
-        let contract_hist = contract.clone();
-        let bar_cache_hist = bar_cache.clone();
-        tokio::spawn(async move {
-            match client_hist
-                .historical_data_streaming(
-                    &contract_hist,
-                    1.days(),
-                    HistoricalBarSize::Min,
-                    Some(HistoricalWhatToShow::Trades),
-                    TradingHours::Extended,
-                    true,
-                )
-                .await
-            {
-                Ok(mut subscription) => {
-                    info!("{symbol_hist}: streaming historical data started");
-                    while let Some(update) = subscription.next().await {
-                        match update {
-                            HistoricalBarUpdate::Historical(data) => {
-                                let bars: Vec<BarData> = data
-                                    .bars
-                                    .iter()
-                                    .map(|b| BarData {
-                                        timestamp: b.date.unix_timestamp() as u64 * 1000,
-                                        open: b.open,
-                                        high: b.high,
-                                        low: b.low,
-                                        close: b.close,
-                                        volume: b.volume,
-                                    })
-                                    .collect();
-                                info!(
-                                    "{symbol_hist}: caching and broadcasting {} historical bars",
-                                    bars.len()
-                                );
-                                bar_cache_hist
-                                    .write()
-                                    .await
-                                    .insert(symbol_hist.clone(), bars.clone());
-                                let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
-                                    symbol: symbol_hist.clone(),
-                                    bars,
-                                });
-                            }
-                            HistoricalBarUpdate::Update(bar) => {
-                                let bar_data = BarData {
-                                    timestamp: bar.date.unix_timestamp() as u64 * 1000,
-                                    open: bar.open,
-                                    high: bar.high,
-                                    low: bar.low,
-                                    close: bar.close,
-                                    volume: bar.volume,
-                                };
+                let contract = Contract {
+                    contract_id: req.contract_id,
+                    symbol: Symbol(req.symbol.clone()),
+                    security_type: SecurityType::from(req.security_type.as_str()),
+                    exchange: Exchange(req.exchange),
+                    currency: Currency(req.currency),
+                    primary_exchange: Exchange(req.primary_exchange),
+                    last_trade_date_or_contract_month: req.last_trade_date_or_contract_month,
+                    strike: req.strike,
+                    right: req.right,
+                    ..Default::default()
+                };
+                let symbol = req.symbol.clone();
 
-                                // IBKR sends repeated updates for the in-progress bar as trades occur;
-                                // same timestamp means the bar is still forming — update in place, don't duplicate.
-                                {
-                                    let mut cache = bar_cache_hist.write().await;
-                                    let bars =
-                                        cache.entry(symbol_hist.clone()).or_default();
-                                    if let Some(last) = bars.last_mut() {
-                                        if last.timestamp == bar_data.timestamp {
-                                            *last = bar_data.clone();
+                contract_cache.write().await.insert(symbol.clone(), contract.clone());
+
+                // Tick-by-tick streaming (not snapshot polling) to minimize latency and API rate limit usage.
+                let client_tick = client.clone();
+                let msg_tx_tick = msg_tx.clone();
+                let symbol_tick = symbol.clone();
+                let contract_tick = contract.clone();
+                tokio::spawn(async move {
+                    match client_tick
+                        .tick_by_tick_bid_ask(&contract_tick, 0, false)
+                        .await
+                    {
+                        Ok(mut subscription) => {
+                            info!("Subscribed to tick-by-tick bid/ask for {symbol_tick}");
+
+                            while let Some(tick_result) = subscription.next().await {
+                                match tick_result {
+                                    Ok(BidAsk {
+                                        time,
+                                        bid_price,
+                                        ask_price,
+                                        bid_size,
+                                        ask_size,
+                                        ..
+                                    }) => {
+                                        let timestamp_ms = time.unix_timestamp() as u64 * 1000;
+                                        // Mid-price when both sides are quoted; fall back to whichever
+                                        // side exists (pre/post-market often has only one side).
+                                        let last_price = if bid_price > 0.0 && ask_price > 0.0 {
+                                            (bid_price + ask_price) / 2.0
+                                        } else if ask_price > 0.0 {
+                                            ask_price
                                         } else {
-                                            bars.push(bar_data.clone());
-                                        }
-                                    } else {
-                                        bars.push(bar_data.clone());
+                                            bid_price
+                                        };
+
+                                        let msg = ServerMessage::PriceUpdate {
+                                            symbol: symbol_tick.clone(),
+                                            last_price,
+                                            timestamp: timestamp_ms,
+                                            best_bid_price: bid_price,
+                                            best_bid_size: bid_size,
+                                            best_ask_price: ask_price,
+                                            best_ask_size: ask_size,
+                                        };
+
+                                        let _ = msg_tx_tick.send(msg);
+                                        debug!(
+                                            "{symbol_tick} tick: bid {bid_price} x {bid_size} | ask {ask_price} x {ask_size} @ {timestamp_ms}"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("{symbol_tick} tick subscription error: {e}");
+                                        break;
                                     }
                                 }
-
-                                let _ = msg_tx_hist.send(ServerMessage::RealtimeBar {
-                                    symbol: symbol_hist.clone(),
-                                    bar: bar_data,
-                                });
-                            }
-                            HistoricalBarUpdate::End { .. } => {
-                                info!("{symbol_hist}: historical backfill complete, continuing with live bars");
                             }
                         }
+                        Err(e) => {
+                            error!("Failed to subscribe to tick data for {symbol_tick}: {e}");
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("{symbol_hist}: historical data streaming failed: {e}");
-                }
+                });
+
+                // Streaming historical API delivers the initial batch then continues with live bar updates
+                // on the same subscription — chart backfill and live candles from a single API call.
+                let client_hist = client.clone();
+                let msg_tx_hist = msg_tx.clone();
+                let symbol_hist = symbol.clone();
+                let contract_hist = contract.clone();
+                let bar_cache_hist = bar_cache.clone();
+                tokio::spawn(async move {
+                    match client_hist
+                        .historical_data_streaming(
+                            &contract_hist,
+                            1.days(),
+                            HistoricalBarSize::Min,
+                            Some(HistoricalWhatToShow::Trades),
+                            TradingHours::Extended,
+                            true,
+                        )
+                        .await
+                    {
+                        Ok(mut subscription) => {
+                            info!("{symbol_hist}: streaming historical data started");
+                            while let Some(update) = subscription.next().await {
+                                match update {
+                                    HistoricalBarUpdate::Historical(data) => {
+                                        let bars: Vec<BarData> = data
+                                            .bars
+                                            .iter()
+                                            .map(|b| BarData {
+                                                timestamp: b.date.unix_timestamp() as u64 * 1000,
+                                                open: b.open,
+                                                high: b.high,
+                                                low: b.low,
+                                                close: b.close,
+                                                volume: b.volume,
+                                            })
+                                            .collect();
+                                        info!(
+                                            "{symbol_hist}: caching and broadcasting {} historical bars",
+                                            bars.len()
+                                        );
+                                        bar_cache_hist
+                                            .write()
+                                            .await
+                                            .insert(symbol_hist.clone(), bars.clone());
+                                        let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
+                                            symbol: symbol_hist.clone(),
+                                            bars,
+                                        });
+                                    }
+                                    HistoricalBarUpdate::Update(bar) => {
+                                        let bar_data = BarData {
+                                            timestamp: bar.date.unix_timestamp() as u64 * 1000,
+                                            open: bar.open,
+                                            high: bar.high,
+                                            low: bar.low,
+                                            close: bar.close,
+                                            volume: bar.volume,
+                                        };
+
+                                        // IBKR sends repeated updates for the in-progress bar as trades occur;
+                                        // same timestamp means the bar is still forming — update in place, don't duplicate.
+                                        {
+                                            let mut cache = bar_cache_hist.write().await;
+                                            let bars =
+                                                cache.entry(symbol_hist.clone()).or_default();
+                                            if let Some(last) = bars.last_mut() {
+                                                if last.timestamp == bar_data.timestamp {
+                                                    *last = bar_data.clone();
+                                                } else {
+                                                    bars.push(bar_data.clone());
+                                                }
+                                            } else {
+                                                bars.push(bar_data.clone());
+                                            }
+                                        }
+
+                                        let _ = msg_tx_hist.send(ServerMessage::RealtimeBar {
+                                            symbol: symbol_hist.clone(),
+                                            bar: bar_data,
+                                        });
+                                    }
+                                    HistoricalBarUpdate::End { .. } => {
+                                        info!("{symbol_hist}: historical backfill complete, continuing with live bars");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("{symbol_hist}: historical data streaming failed: {e}");
+                        }
+                    }
+                });
             }
-        });
+            Some(req) = order_rx.recv() => {
+                // Prefer cached contract from subscription; fall back to building from request fields.
+                let contract = if let Some(cached) = contract_cache.read().await.get(&req.symbol) {
+                    cached.clone()
+                } else {
+                    Contract {
+                        contract_id: req.contract_id,
+                        symbol: Symbol(req.symbol.clone()),
+                        security_type: SecurityType::from(req.security_type.as_str()),
+                        exchange: Exchange(req.exchange.clone()),
+                        currency: Currency(req.currency.clone()),
+                        primary_exchange: Exchange(req.primary_exchange.clone()),
+                        last_trade_date_or_contract_month: req.last_trade_date_or_contract_month.clone(),
+                        strike: req.strike,
+                        right: req.right.clone(),
+                        ..Default::default()
+                    }
+                };
+
+                let action = match req.action.to_uppercase().as_str() {
+                    "SELL" => Action::Sell,
+                    _ => Action::Buy,
+                };
+
+                let builder = OrderBuilder::new(client.as_ref(), &contract);
+                let builder = match action {
+                    Action::Buy => builder.buy(req.quantity),
+                    _ => builder.sell(req.quantity),
+                };
+                let builder = match req.order_type.to_uppercase().as_str() {
+                    "LMT" => builder.limit(req.limit_price.unwrap_or(0.0)),
+                    "STP" => builder.stop(req.stop_price.unwrap_or(0.0)),
+                    _ => builder.market(),
+                };
+                let builder = match req.time_in_force.to_uppercase().as_str() {
+                    "GTC" => builder.good_till_cancel(),
+                    "IOC" => builder.immediate_or_cancel(),
+                    _ => builder.day_order(),
+                };
+
+                let order = match builder.build() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!("Failed to build order for {}: {e}", req.symbol);
+                        continue;
+                    }
+                };
+
+                let order_id = client.next_order_id();
+                info!(
+                    "Placing {} {} order #{order_id} for {} x {} {}",
+                    req.order_type, req.action, req.quantity, req.symbol,
+                    req.limit_price.map(|p| format!("@ {p}")).unwrap_or_default()
+                );
+
+                // Seed the cache so clients see the order immediately.
+                let initial_update = OrderUpdate {
+                    order_id,
+                    symbol: req.symbol.clone(),
+                    action: req.action.clone(),
+                    order_type: req.order_type.clone(),
+                    quantity: req.quantity,
+                    limit_price: req.limit_price,
+                    stop_price: req.stop_price,
+                    status: "PendingSubmit".to_string(),
+                    filled: 0.0,
+                    remaining: req.quantity,
+                    average_fill_price: 0.0,
+                };
+                order_cache.write().await.insert(order_id, initial_update.clone());
+                let _ = msg_tx.send(ServerMessage::OrderUpdate(initial_update));
+
+                let client_ord = client.clone();
+                let msg_tx_ord = msg_tx.clone();
+                let order_cache_ord = order_cache.clone();
+                let symbol_ord = req.symbol.clone();
+                let action_str = req.action.clone();
+                let order_type_str = req.order_type.clone();
+                let quantity = req.quantity;
+                let limit_price = req.limit_price;
+                let stop_price = req.stop_price;
+
+                tokio::spawn(async move {
+                    match client_ord.place_order(order_id, &contract, &order).await {
+                        Ok(mut subscription) => {
+                            while let Some(result) = subscription.next().await {
+                                match result {
+                                    Ok(IbPlaceOrder::OrderStatus(IbOrderStatus {
+                                        status,
+                                        filled,
+                                        remaining,
+                                        average_fill_price,
+                                        ..
+                                    })) => {
+                                        let update = OrderUpdate {
+                                            order_id,
+                                            symbol: symbol_ord.clone(),
+                                            action: action_str.clone(),
+                                            order_type: order_type_str.clone(),
+                                            quantity,
+                                            limit_price,
+                                            stop_price,
+                                            status: status.clone(),
+                                            filled,
+                                            remaining,
+                                            average_fill_price,
+                                        };
+                                        order_cache_ord.write().await.insert(order_id, update.clone());
+                                        let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
+                                        info!("Order #{order_id} {symbol_ord}: {status} (filled {filled}, remaining {remaining})");
+                                    }
+                                    Ok(IbPlaceOrder::ExecutionData(exec)) => {
+                                        info!(
+                                            "Order #{order_id} {symbol_ord}: execution {} shares @ {}",
+                                            exec.execution.shares, exec.execution.price
+                                        );
+                                    }
+                                    Ok(IbPlaceOrder::CommissionReport(cr)) => {
+                                        debug!(
+                                            "Order #{order_id}: commission {}",
+                                            cr.commission
+                                        );
+                                    }
+                                    Ok(IbPlaceOrder::OpenOrder(_)) => {}
+                                    Ok(IbPlaceOrder::Message(notice)) => {
+                                        info!("Order #{order_id} notice: {notice}");
+                                    }
+                                    Err(e) => {
+                                        error!("Order #{order_id} error: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to place order #{order_id} for {symbol_ord}: {e}");
+                            let update = OrderUpdate {
+                                order_id,
+                                symbol: symbol_ord,
+                                action: action_str,
+                                order_type: order_type_str,
+                                quantity,
+                                limit_price,
+                                stop_price,
+                                status: format!("Error: {e}"),
+                                filled: 0.0,
+                                remaining: quantity,
+                                average_fill_price: 0.0,
+                            };
+                            order_cache_ord.write().await.insert(order_id, update.clone());
+                            let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
+                        }
+                    }
+                });
+            }
+            else => break,
+        }
     }
 }
 
@@ -494,10 +723,12 @@ async fn ws_handler(
     let rx = state.msg_tx.subscribe();
     let msg_tx = state.msg_tx.clone();
     let subscribe_tx = state.subscribe_tx.clone();
+    let order_tx = state.order_tx.clone();
     let bar_cache = state.bar_cache.clone();
     let position_cache = state.position_cache.clone();
     let config_cache = state.config_cache.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, bar_cache, position_cache, config_cache))
+    let order_cache = state.order_cache.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, order_tx, bar_cache, position_cache, config_cache, order_cache))
 }
 
 /// Single task handles both directions via `tokio::select!` so we detect client disconnect
@@ -507,9 +738,11 @@ async fn handle_socket(
     mut rx: broadcast::Receiver<ServerMessage>,
     msg_tx: broadcast::Sender<ServerMessage>,
     subscribe_tx: mpsc::Sender<SubscribeRequest>,
+    order_tx: mpsc::Sender<OrderRequest>,
     bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>>,
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
+    order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
 ) {
     // Broadcast receivers only see messages sent after they subscribe, so late-joining clients
     // would have no positions without this eager send from the cache.
@@ -546,6 +779,18 @@ async fn handle_socket(
         let cache = config_cache.read().await;
         for cfg in cache.values() {
             let msg = ServerMessage::ContractConfig(cfg.clone());
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(Message::Text(json)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    {
+        let cache = order_cache.read().await;
+        for update in cache.values() {
+            let msg = ServerMessage::OrderUpdate(update.clone());
             if let Ok(json) = serde_json::to_string(&msg) {
                 if socket.send(Message::Text(json)).await.is_err() {
                     return;
@@ -601,6 +846,10 @@ async fn handle_socket(
                                 );
                                 config_cache.write().await.insert(cfg.symbol.clone(), cfg.clone());
                                 let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
+                            }
+                            Ok(ClientMessage::PlaceOrder(req)) => {
+                                info!("Client order request: {} {} {} x {}", req.action, req.order_type, req.quantity, req.symbol);
+                                let _ = order_tx.send(req).await;
                             }
                             Err(e) => {
                                 info!("Invalid client message: {e}");
