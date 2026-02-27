@@ -3,6 +3,7 @@
 ## Phase 1 — Order Execution
 - ~~**Order submission** — Market, Limit, Stop orders via IBKR API~~ **DONE**
 - ~~**Order lifecycle tracking** — open/filled/cancelled/rejected states, displayed in UI~~ **DONE**
+- ~~**Order lifecycle state machine** — validated state transitions, race condition handling (fill during cancel/amend), IBKR event mapping, terminal state enforcement~~ **DONE**
 - **Order modification/cancellation** — modify price/quantity of working orders
 - **Basic execution logging** — persist order history for audit
 
