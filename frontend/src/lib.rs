@@ -746,6 +746,7 @@ fn App() -> impl IntoView {
                         <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Exchange"</label>
                         <input
                             type="text"
+                            list="exchanges"
                             prop:value=move || exchange_input.get()
                             on:input=move |e| exchange_input.set(event_target_value(&e))
                             style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
@@ -755,6 +756,7 @@ fn App() -> impl IntoView {
                         <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Currency"</label>
                         <input
                             type="text"
+                            list="currencies"
                             prop:value=move || currency_input.get()
                             on:input=move |e| currency_input.set(event_target_value(&e))
                             style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
@@ -766,6 +768,7 @@ fn App() -> impl IntoView {
                         <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Primary Exch"</label>
                         <input
                             type="text"
+                            list="exchanges"
                             placeholder="e.g. ASX"
                             prop:value=move || primary_exchange_input.get()
                             on:input=move |e| primary_exchange_input.set(event_target_value(&e))
@@ -823,6 +826,48 @@ fn App() -> impl IntoView {
                     </button>
                 </div>
             </div>
+
+            <datalist id="exchanges">
+                <option value="SMART" />
+                <option value="ASX" />
+                <option value="NYSE" />
+                <option value="NASDAQ" />
+                <option value="ARCA" />
+                <option value="AMEX" />
+                <option value="BATS" />
+                <option value="LSE" />
+                <option value="HKEX" />
+                <option value="TSE" />
+                <option value="OSE" />
+                <option value="SGX" />
+                <option value="CME" />
+                <option value="CBOE" />
+                <option value="NYMEX" />
+                <option value="COMEX" />
+                <option value="GLOBEX" />
+                <option value="ECBOT" />
+                <option value="IDEALPRO" />
+                <option value="IBKRATS" />
+            </datalist>
+            <datalist id="currencies">
+                <option value="USD" />
+                <option value="AUD" />
+                <option value="EUR" />
+                <option value="GBP" />
+                <option value="JPY" />
+                <option value="HKD" />
+                <option value="CAD" />
+                <option value="CHF" />
+                <option value="SGD" />
+                <option value="NZD" />
+                <option value="SEK" />
+                <option value="NOK" />
+                <option value="DKK" />
+                <option value="KRW" />
+                <option value="INR" />
+                <option value="MXN" />
+                <option value="ZAR" />
+            </datalist>
 
             // Contract rows (price card + candlestick chart)
             {move || {
