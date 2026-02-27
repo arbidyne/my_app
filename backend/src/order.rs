@@ -371,9 +371,16 @@ pub fn map_ibkr_to_event(event: &IbPlaceOrder) -> Option<OrderEvent> {
             avg_fill_price: exec.execution.average_price,
         }),
         // Logged separately by the monitoring task.
-        IbPlaceOrder::CommissionReport(_)
-        | IbPlaceOrder::OpenOrder(_)
-        | IbPlaceOrder::Message(_) => None,
+        IbPlaceOrder::Message(notice) => {
+            if (100..450).contains(&notice.code) || notice.code >= 10000 {
+                Some(OrderEvent::AckReject {
+                    reason: format!("[{}] {}", notice.code, notice.message),
+                })
+            } else {
+                None
+            }
+        }
+        IbPlaceOrder::CommissionReport(_) | IbPlaceOrder::OpenOrder(_) => None,
     }
 }
 
@@ -777,6 +784,31 @@ mod tests {
         };
         let event = IbCancelOrder::Notice(notice);
         assert!(map_cancel_order_to_event(&event).is_none());
+    }
+
+    #[test]
+    fn map_ibkr_message_error_rejects() {
+        use ibapi::messages::Notice;
+        let notice = Notice {
+            code: 321,
+            message: "Error validating request".to_string(),
+            error_time: None,
+        };
+        let event = IbPlaceOrder::Message(notice);
+        let mapped = map_ibkr_to_event(&event).unwrap();
+        assert!(matches!(mapped, OrderEvent::AckReject { .. }));
+    }
+
+    #[test]
+    fn map_ibkr_message_warning_ignored() {
+        use ibapi::messages::Notice;
+        let notice = Notice {
+            code: 2104,
+            message: "Market data farm connection is OK".to_string(),
+            error_time: None,
+        };
+        let event = IbPlaceOrder::Message(notice);
+        assert!(map_ibkr_to_event(&event).is_none());
     }
 
     #[test]
