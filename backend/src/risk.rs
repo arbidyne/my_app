@@ -6,6 +6,51 @@
 //! `min_pos_size=0` means "no minimum" (disabled).
 
 use crate::{ContractConfig, TradingState};
+use std::collections::VecDeque;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// Sliding-window rate limiter that triggers a kill switch when too many orders
+/// arrive within a time window. Accepts `now: Instant` for deterministic testing.
+pub struct OrderRateLimiter {
+    timestamps: VecDeque<Instant>,
+    max_orders: usize,
+    window: Duration,
+}
+
+impl OrderRateLimiter {
+    pub fn new(max_orders: usize, window: Duration) -> Self {
+        Self {
+            timestamps: VecDeque::new(),
+            max_orders,
+            window,
+        }
+    }
+
+    /// Records an order and returns `Err` if the rate limit is breached.
+    pub fn check(&mut self, now: Instant) -> Result<(), String> {
+        // Prune timestamps that have fallen outside the window.
+        while let Some(&front) = self.timestamps.front() {
+            if now.duration_since(front) > self.window {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.timestamps.push_back(now);
+
+        if self.timestamps.len() > self.max_orders {
+            Err(format!(
+                "Order rate limit breached: {} orders in {:?}",
+                self.timestamps.len(),
+                self.window
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Returns `true` if the order would reduce (or exactly close) the current position.
 fn is_reducing(action: &str, quantity: f64, current_position: f64) -> bool {
@@ -236,5 +281,70 @@ mod tests {
     fn reducing_only_allows_exact_close() {
         let cfg = config(100, 100, 0);
         assert!(check_risk("SELL", 10.0, &cfg, 10.0, &TradingState::ReducingOnly).is_ok());
+    }
+
+    // --- Rate limiter tests ---
+
+    #[test]
+    fn rate_limit_allows_within_limit() {
+        let mut rl = OrderRateLimiter::new(5, Duration::from_secs(2));
+        let start = Instant::now();
+        for i in 0..5 {
+            assert!(
+                rl.check(start + Duration::from_millis(i * 100)).is_ok(),
+                "order {i} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_breaches_on_sixth() {
+        let mut rl = OrderRateLimiter::new(5, Duration::from_secs(2));
+        let start = Instant::now();
+        for i in 0..5 {
+            rl.check(start + Duration::from_millis(i * 100)).unwrap();
+        }
+        let err = rl
+            .check(start + Duration::from_millis(500))
+            .unwrap_err();
+        assert!(err.contains("rate limit"), "got: {err}");
+    }
+
+    #[test]
+    fn rate_limit_resets_after_window() {
+        let mut rl = OrderRateLimiter::new(5, Duration::from_secs(2));
+        let start = Instant::now();
+        for i in 0..5 {
+            rl.check(start + Duration::from_millis(i * 100)).unwrap();
+        }
+        // Jump past the window — all old entries should be pruned.
+        assert!(rl.check(start + Duration::from_secs(3)).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_sliding_window() {
+        let mut rl = OrderRateLimiter::new(5, Duration::from_secs(2));
+        let start = Instant::now();
+        // Place 3 orders at t=0, t=100ms, t=200ms.
+        for i in 0..3 {
+            rl.check(start + Duration::from_millis(i * 100)).unwrap();
+        }
+        // At t=2.1s the first 3 have expired, so 2 more + the next 3 should fit (5 total).
+        let t = start + Duration::from_millis(2100);
+        for i in 0..2 {
+            assert!(
+                rl.check(t + Duration::from_millis(i * 50)).is_ok(),
+                "post-expiry order {i} should pass"
+            );
+        }
+        // We now have 2 in window. Add 3 more → 5 total, still ok.
+        for i in 0..3 {
+            assert!(
+                rl.check(t + Duration::from_millis(100 + i * 50)).is_ok(),
+                "filling to limit order {i} should pass"
+            );
+        }
+        // 6th in window → breach.
+        assert!(rl.check(t + Duration::from_millis(300)).is_err());
     }
 }

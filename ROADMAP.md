@@ -12,7 +12,7 @@
 - ~~**Trading states** — Active / Halted / Reducing-only mode (global kill switch)~~ **DONE** 
 - ~~**P&L tracking (unrealized)** — unrealized P&L and notional value per position, displayed on price cards.  Notional = price × multiplier × |position_size|, unrealized P&L = (price − avg_cost) × position_size × multiplier.  Color-coded green/red.~~ **DONE** *(realized P&L requires fill tracking — follow-up)*
 - **Daily loss limit** — auto-halt trading if drawdown exceeds threshold
-- **Order Rate Limit Check** - build a rate limiter.  If more than 5 orders are sent in 2 seconds, the global kill switch should trigger and stop trading. The rates (number of orders and time window) will be hardcoded for now but later we will add them to global configuration.
+- ~~**Order Rate Limit Check** - build a rate limiter.  If more than 5 orders are sent in 2 seconds, the global kill switch should trigger and stop trading. The rates (number of orders and time window) will be hardcoded for now but later we will add them to global configuration.~~ **DONE**
 
 ## Phase 3 — Autotrader Framework
 - **Strategy trait/interface** — define a standard interface strategies implement (on_tick, on_bar, on_fill)

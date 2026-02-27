@@ -31,6 +31,7 @@ use order::{map_cancel_order_to_event, map_ibkr_to_event, OrderEvent, OrderState
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -453,6 +454,7 @@ async fn subscription_manager(
 
     let mut subscribed: HashSet<ContractKey> = HashSet::new();
     let order_store: OrderStore = Arc::new(RwLock::new(HashMap::new()));
+    let mut rate_limiter = risk::OrderRateLimiter::new(5, Duration::from_secs(2));
     // Reverse lookup: client_order_id → IBKR order_id, so cancel/modify can resolve by UUID.
     let client_id_to_order_id: Arc<RwLock<HashMap<Uuid, i32>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -672,6 +674,30 @@ async fn subscription_manager(
             Some(cmd) = order_rx.recv() => {
                 match cmd {
                     OrderCommand::Place(req) => {
+                        // --- Order rate limit check ---
+                        if let Err(reason) = rate_limiter.check(tokio::time::Instant::now()) {
+                            warn!("Rate limit triggered for {}: {reason}", req.symbol);
+                            *trading_state.write().await = TradingState::Halted;
+                            let _ = msg_tx.send(ServerMessage::TradingState { state: TradingState::Halted });
+                            let static_fields = OrderStaticFields {
+                                client_order_id: req.client_order_id,
+                                symbol: req.symbol.clone(),
+                                action: req.action.clone(),
+                                order_type: req.order_type.clone(),
+                                quantity: req.quantity,
+                                limit_price: req.limit_price,
+                                stop_price: req.stop_price,
+                                time_in_force: if req.time_in_force.is_empty() { "DAY".to_string() } else { req.time_in_force.clone() },
+                            };
+                            let mut sm = OrderStateMachine::new(0, req.quantity);
+                            let _ = sm.apply(OrderEvent::Submit);
+                            let _ = sm.apply(OrderEvent::AckReject { reason });
+                            let update = build_order_update(0, &static_fields, &sm);
+                            order_cache.write().await.insert(0, update.clone());
+                            let _ = msg_tx.send(ServerMessage::OrderUpdate(update));
+                            continue;
+                        }
+
                         // Prefer cached contract; fall back to building from request fields.
                         let contract = if let Some(cached) = contract_cache.read().await.get(&req.symbol) {
                             cached.clone()
