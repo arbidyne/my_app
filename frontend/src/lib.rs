@@ -60,6 +60,7 @@ enum ServerMessage {
     PositionUpdate(PositionData),
     ContractConfig(ContractConfig),
     OrderUpdate(OrderUpdate),
+    TradingState { state: TradingState },
 }
 
 #[derive(Serialize)]
@@ -146,6 +147,44 @@ struct ModifyOrderMsg {
     stop_price: Option<f64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TradingState {
+    Active,
+    Halted,
+    ReducingOnly,
+}
+
+impl TradingState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Halted => "Halted",
+            Self::ReducingOnly => "Reducing Only",
+        }
+    }
+
+    fn color(&self) -> &'static str {
+        match self {
+            Self::Active => "#16a34a",
+            Self::Halted => "#dc2626",
+            Self::ReducingOnly => "#d97706",
+        }
+    }
+}
+
+impl Default for TradingState {
+    fn default() -> Self {
+        Self::Halted
+    }
+}
+
+#[derive(Serialize)]
+struct SetTradingStateMsg {
+    r#type: String,
+    state: TradingState,
+}
+
 // ---------------------------------------------------------------------------
 // ApexCharts JS interop helpers
 // ---------------------------------------------------------------------------
@@ -177,6 +216,84 @@ fn destroy_apex_chart(chart: &JsValue) {
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
+
+#[component]
+fn TradingStateControl(
+    trading_state: RwSignal<TradingState>,
+    ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>>,
+) -> impl IntoView {
+    let make_handler = |target: TradingState| {
+        let ws = ws_ref.clone();
+        move |_| {
+            trading_state.set(target.clone());
+            let msg = SetTradingStateMsg {
+                r#type: "set_trading_state".to_string(),
+                state: target.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if let Some(ws) = ws.borrow().as_ref() {
+                    let _ = ws.send_with_str(&json);
+                }
+            }
+        }
+    };
+
+    let on_active = make_handler(TradingState::Active);
+    let on_reducing = make_handler(TradingState::ReducingOnly);
+    let on_halted = make_handler(TradingState::Halted);
+
+    let btn_base = "padding: 6px 16px; border: none; border-radius: 6px; font-size: 0.85em; font-weight: 600; cursor: pointer;";
+
+    view! {
+        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 20px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 20px;">
+            <span style="font-size: 0.9em; font-weight: 600; color: #333; margin-right: 4px;">"Trading:"</span>
+            <span style=move || {
+                let ts = trading_state.get();
+                format!(
+                    "font-size: 0.9em; font-weight: 700; color: {};",
+                    ts.color()
+                )
+            }>
+                {move || trading_state.get().label().to_string()}
+            </span>
+            <div style="margin-left: auto; display: flex; gap: 6px;">
+                <button
+                    on:click=on_active
+                    style=move || {
+                        let selected = trading_state.get() == TradingState::Active;
+                        format!(
+                            "{btn_base} background: {}; color: {};",
+                            if selected { "#16a34a" } else { "#e5e7eb" },
+                            if selected { "#fff" } else { "#333" },
+                        )
+                    }
+                >"Active"</button>
+                <button
+                    on:click=on_reducing
+                    style=move || {
+                        let selected = trading_state.get() == TradingState::ReducingOnly;
+                        format!(
+                            "{btn_base} background: {}; color: {};",
+                            if selected { "#d97706" } else { "#e5e7eb" },
+                            if selected { "#fff" } else { "#333" },
+                        )
+                    }
+                >"Reducing Only"</button>
+                <button
+                    on:click=on_halted
+                    style=move || {
+                        let selected = trading_state.get() == TradingState::Halted;
+                        format!(
+                            "{btn_base} background: {}; color: {};",
+                            if selected { "#dc2626" } else { "#e5e7eb" },
+                            if selected { "#fff" } else { "#333" },
+                        )
+                    }
+                >"Halted"</button>
+            </div>
+        </div>
+    }
+}
 
 #[component]
 fn PriceCard(price: PriceUpdate, position: Option<PositionData>) -> impl IntoView {
@@ -395,6 +512,7 @@ fn ContractRow(
     positions: RwSignal<HashMap<String, PositionData>>,
     configs: RwSignal<HashMap<String, ContractConfig>>,
     orders: RwSignal<HashMap<Uuid, OrderUpdate>>,
+    trading_state: RwSignal<TradingState>,
     ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>>,
 ) -> impl IntoView {
     let sym_for_price = symbol.clone();
@@ -716,7 +834,14 @@ fn ContractRow(
                         </div>
                         <button
                             on:click=on_submit_order
-                            style="padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer;"
+                            disabled=move || trading_state.get() == TradingState::Halted
+                            style=move || {
+                                if trading_state.get() == TradingState::Halted {
+                                    "padding: 6px 16px; background: #9ca3af; color: #fff; border: none; border-radius: 6px; font-size: 0.9em; cursor: not-allowed;"
+                                } else {
+                                    "padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer;"
+                                }
+                            }
                         >
                             "Submit Order"
                         </button>
@@ -751,6 +876,7 @@ fn ContractRow(
                                 <thead>
                                     <tr style="text-align: left; color: #888; border-bottom: 1px solid #e5e7eb;">
                                         <th style="padding: 4px 8px;">"ID"</th>
+                                        <th style="padding: 4px 8px;">"UUID"</th>
                                         <th style="padding: 4px 8px;">"Action"</th>
                                         <th style="padding: 4px 8px;">"Type"</th>
                                         <th style="padding: 4px 8px;">"Qty"</th>
@@ -927,8 +1053,11 @@ fn ContractRow(
                                                     if o.order_id > 0 {
                                                         o.order_id.to_string()
                                                     } else {
-                                                        o.client_order_id.to_string()[..8].to_string()
+                                                        "\u{2014}".to_string()
                                                     }
+                                                }</td>
+                                                <td style="padding: 4px 8px; font-family: monospace; font-size: 0.9em; color: #6b7280;">{
+                                                    o.client_order_id.to_string()[..8].to_string()
                                                 }</td>
                                                 <td style="padding: 4px 8px; font-weight: 600;">{o.action.clone()}</td>
                                                 <td style="padding: 4px 8px;">{o.order_type.clone()}</td>
@@ -958,6 +1087,7 @@ fn App() -> impl IntoView {
     let positions: RwSignal<HashMap<String, PositionData>> = RwSignal::new(HashMap::new());
     let configs: RwSignal<HashMap<String, ContractConfig>> = RwSignal::new(HashMap::new());
     let orders: RwSignal<HashMap<Uuid, OrderUpdate>> = RwSignal::new(HashMap::new());
+    let trading_state: RwSignal<TradingState> = RwSignal::new(TradingState::default());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -1040,6 +1170,9 @@ fn App() -> impl IntoView {
                         orders.update(|map| {
                             map.insert(update.client_order_id, update);
                         });
+                    }
+                    Ok(ServerMessage::TradingState { state }) => {
+                        trading_state.set(state);
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
                 }
@@ -1150,6 +1283,9 @@ fn App() -> impl IntoView {
                     {move || if connected.get() { "Connected" } else { "Disconnected" }}
                 </span>
             </div>
+
+            // Trading state control
+            <TradingStateControl trading_state=trading_state ws_ref=ws_ref.clone() />
 
             // Subscription form
             <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin-bottom: 24px;">
@@ -1334,6 +1470,7 @@ fn App() -> impl IntoView {
                                             positions=positions
                                             configs=configs
                                             orders=orders
+                                            trading_state=trading_state
                                             ws_ref=ws
                                         />
                                     }

@@ -9,7 +9,7 @@
 
 ## Phase 2 — Risk Management
 - ~~**Pre-trade risk checks** — enforce max_pos_size, max_order_size, min_pos_size before submitting.  All these checks should be done at the backend only.  Any failures should put the order into Rejected status and must not be submitted to IB.  Autotrade gate rejects orders when autotrade=false.  Zero limits mean "zero tolerance" (fail-closed).~~ **DONE**
-- **Trading states** — Active / Halted / Reducing-only mode (global kill switch)
+- ~~**Trading states** — Active / Halted / Reducing-only mode (global kill switch)~~ **DONE**
 - **Max notional limits** — cap dollar exposure per contract
 - **P&L tracking** — realized and unrealized P&L per position, displayed on price cards
 - **Daily loss limit** — auto-halt trading if drawdown exceeds threshold

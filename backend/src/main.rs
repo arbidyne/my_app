@@ -70,6 +70,32 @@ struct ContractConfig {
     lot_size: u32,
 }
 
+/// Global kill switch that overrides per-contract `autotrade` settings.
+/// Starts `Halted` on launch (fail-closed). In-memory only — resets to `Halted` on restart.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingState {
+    Active,
+    Halted,
+    ReducingOnly,
+}
+
+impl Default for TradingState {
+    fn default() -> Self {
+        Self::Halted
+    }
+}
+
+impl std::fmt::Display for TradingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "Active"),
+            Self::Halted => write!(f, "Halted"),
+            Self::ReducingOnly => write!(f, "ReducingOnly"),
+        }
+    }
+}
+
 /// Client-submitted order with contract identification and order parameters.
 #[derive(Clone, Debug, Deserialize)]
 struct OrderRequest {
@@ -205,6 +231,9 @@ enum ServerMessage {
     PositionUpdate(PositionData),
     ContractConfig(ContractConfig),
     OrderUpdate(OrderUpdate),
+    TradingState {
+        state: TradingState,
+    },
 }
 
 /// IBKR rejects duplicate subscriptions and charges per active subscription, so we dedup
@@ -253,6 +282,7 @@ enum ClientMessage {
     PlaceOrder(OrderRequest),
     CancelOrder { client_order_id: Uuid },
     ModifyOrder(ModifyOrderRequest),
+    SetTradingState { state: TradingState },
 }
 
 /// Caches use `Arc<RwLock<>>` because many WebSocket tasks read concurrently while only
@@ -266,6 +296,7 @@ struct AppState {
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
+    trading_state: Arc<RwLock<TradingState>>,
 }
 
 #[tokio::main]
@@ -303,6 +334,9 @@ async fn main() -> Result<()> {
     let contract_cache: Arc<RwLock<HashMap<String, Contract>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    let trading_state: Arc<RwLock<TradingState>> =
+        Arc::new(RwLock::new(TradingState::default()));
+
     // Runs in a dedicated task so the HTTP server can start accepting connections immediately.
     let msg_tx_clone = msg_tx.clone();
     let bar_cache_clone = bar_cache.clone();
@@ -311,8 +345,9 @@ async fn main() -> Result<()> {
     let order_cache_clone = order_cache.clone();
     let contract_cache_clone = contract_cache.clone();
     let subscribe_tx_clone = subscribe_tx.clone();
+    let trading_state_clone = trading_state.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone)
+        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone, trading_state_clone)
             .await;
     });
 
@@ -324,6 +359,7 @@ async fn main() -> Result<()> {
         position_cache,
         config_cache,
         order_cache,
+        trading_state,
     };
 
     let app = Router::new()
@@ -349,6 +385,7 @@ async fn subscription_manager(
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
     contract_cache: Arc<RwLock<HashMap<String, Contract>>>,
+    trading_state: Arc<RwLock<TradingState>>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -655,13 +692,14 @@ async fn subscription_manager(
 
                         // --- Pre-trade risk check ---
                         let risk_result = {
+                            let ts = trading_state.read().await;
                             let cfg = config_cache.read().await;
                             let pos = position_cache.read().await;
                             match cfg.get(&req.symbol) {
                                 Some(contract_cfg) => {
                                     let current = pos.get(&req.symbol)
                                         .map(|p| p.position_size).unwrap_or(0.0);
-                                    risk::check_risk(&req.action, req.quantity, contract_cfg, current)
+                                    risk::check_risk(&req.action, req.quantity, contract_cfg, current, &ts)
                                 }
                                 None => Err("No risk config for this contract".to_string()),
                             }
@@ -827,6 +865,30 @@ async fn subscription_manager(
                         });
                     }
                     OrderCommand::Modify(req) => {
+                        // Trading state gate for modifications.
+                        {
+                            let ts = trading_state.read().await;
+                            match *ts {
+                                TradingState::Halted => {
+                                    warn!("Modify rejected: trading is halted (client_order_id={})", req.client_order_id);
+                                    continue;
+                                }
+                                TradingState::ReducingOnly => {
+                                    // In reducing-only mode, reject quantity increases.
+                                    if let Some(&oid) = client_id_to_order_id.read().await.get(&req.client_order_id) {
+                                        let store = order_store.read().await;
+                                        if let Some(entry) = store.get(&oid) {
+                                            if req.quantity > entry.static_fields.quantity {
+                                                warn!("Modify rejected: reducing-only mode, quantity increase {} → {} (order #{oid})", entry.static_fields.quantity, req.quantity);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                TradingState::Active => {}
+                            }
+                        }
+
                         let order_id = match client_id_to_order_id.read().await.get(&req.client_order_id) {
                             Some(&id) => id,
                             None => {
@@ -1022,7 +1084,8 @@ async fn ws_handler(
     let position_cache = state.position_cache.clone();
     let config_cache = state.config_cache.clone();
     let order_cache = state.order_cache.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, order_tx, bar_cache, position_cache, config_cache, order_cache))
+    let trading_state = state.trading_state.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, order_tx, bar_cache, position_cache, config_cache, order_cache, trading_state))
 }
 
 /// Single task handles both directions via `tokio::select!` so we detect client disconnect
@@ -1037,6 +1100,7 @@ async fn handle_socket(
     position_cache: Arc<RwLock<HashMap<String, PositionData>>>,
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
+    trading_state: Arc<RwLock<TradingState>>,
 ) {
     // Broadcast receivers only see messages sent after they subscribe, so late-joining clients
     // would have no positions without this eager send from the cache.
@@ -1089,6 +1153,17 @@ async fn handle_socket(
                 if socket.send(Message::Text(json)).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+
+    // Send current trading state so late-joining clients know whether trading is active.
+    {
+        let ts = trading_state.read().await;
+        let msg = ServerMessage::TradingState { state: ts.clone() };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            if socket.send(Message::Text(json)).await.is_err() {
+                return;
             }
         }
     }
@@ -1152,6 +1227,11 @@ async fn handle_socket(
                             Ok(ClientMessage::ModifyOrder(req)) => {
                                 info!("Client modify request: client_order_id={} qty={} limit={:?} stop={:?}", req.client_order_id, req.quantity, req.limit_price, req.stop_price);
                                 let _ = order_tx.send(OrderCommand::Modify(req)).await;
+                            }
+                            Ok(ClientMessage::SetTradingState { state }) => {
+                                info!("Trading state → {state}");
+                                *trading_state.write().await = state.clone();
+                                let _ = msg_tx.send(ServerMessage::TradingState { state });
                             }
                             Err(e) => {
                                 info!("Invalid client message: {e}");
