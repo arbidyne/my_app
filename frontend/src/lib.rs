@@ -255,7 +255,7 @@ fn CandlestickChart(
                         "name": &sym,
                         "data": series_data,
                     }],
-                    "xaxis": { "type": "datetime" },
+                    "xaxis": { "type": "datetime", "labels": { "datetimeUTC": false } },
                     "yaxis": { "tooltip": { "enabled": true } },
                     "plotOptions": {
                         "candlestick": {

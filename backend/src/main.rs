@@ -442,8 +442,7 @@ async fn subscription_manager(
                                 });
                             }
                             HistoricalBarUpdate::End { .. } => {
-                                info!("{symbol_hist}: historical streaming ended");
-                                break;
+                                info!("{symbol_hist}: historical backfill complete, continuing with live bars");
                             }
                         }
                     }
