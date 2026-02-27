@@ -43,7 +43,7 @@ struct ContractConfig {
     symbol: String,
     autotrade: bool,
     max_pos_size: u32,
-    min_pos_size: u32,
+    min_pos_size: i32,
     max_order_size: u32,
     multiplier: f64,
     lot_size: u32,
@@ -66,7 +66,7 @@ struct UpdateContractConfigMsg {
     symbol: String,
     autotrade: bool,
     max_pos_size: u32,
-    min_pos_size: u32,
+    min_pos_size: i32,
     max_order_size: u32,
     multiplier: f64,
     lot_size: u32,
@@ -399,7 +399,7 @@ fn ContractRow(
                     let ws_mnps = ws.clone();
                     let sym_mnps = sym.clone();
                     let on_min_pos = move |e: web_sys::Event| {
-                        let val: u32 = event_target_value(&e).parse().unwrap_or(0);
+                        let val: i32 = event_target_value(&e).parse().unwrap_or(0);
                         configs.update(|map| {
                             if let Some(c) = map.get_mut(&sym_mnps) {
                                 c.min_pos_size = val;
@@ -473,7 +473,6 @@ fn ContractRow(
                                     <label style=label_style>"Min Pos Size"</label>
                                     <input
                                         type="number"
-                                        min="0"
                                         prop:value=cfg.min_pos_size.to_string()
                                         on:change=on_min_pos
                                         style=input_style
