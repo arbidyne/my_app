@@ -595,7 +595,10 @@ async fn handle_socket(
                                 }
                             }
                             Ok(ClientMessage::UpdateContractConfig(cfg)) => {
-                                info!("Config update for {}: autotrade={}", cfg.symbol, cfg.autotrade);
+                                info!(
+                                    "Config update for {}: autotrade={}, max_pos={}, min_pos={}, max_order={}, multiplier={}, lot_size={}",
+                                    cfg.symbol, cfg.autotrade, cfg.max_pos_size, cfg.min_pos_size, cfg.max_order_size, cfg.multiplier, cfg.lot_size
+                                );
                                 config_cache.write().await.insert(cfg.symbol.clone(), cfg.clone());
                                 let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
                             }
