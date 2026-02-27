@@ -723,8 +723,10 @@ fn ContractRow(
                                     {contract_orders.into_iter().map(|o| {
                                         let status_color = match o.status.as_str() {
                                             "Filled" => "#16a34a",
-                                            "Cancelled" | "ApiCancelled" | "Inactive" => "#dc2626",
-                                            s if s.starts_with("Error") => "#dc2626",
+                                            "Cancelled" | "Rejected" => "#dc2626",
+                                            "CancelPending" | "AmendPending" => "#ea580c",
+                                            "Unsent" | "PendingAck" => "#4f46e5",
+                                            "Working" | "PartiallyFilled" => "#ca8a04",
                                             _ => "#ca8a04",
                                         };
                                         let price_display = match o.order_type.as_str() {

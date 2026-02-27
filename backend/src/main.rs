@@ -10,6 +10,8 @@
 //! and fans out data to many browser clients via WebSocket. A broadcast channel lets each
 //! client receive all messages independently without per-client send logic.
 
+mod order;
+
 use anyhow::Result;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -21,8 +23,9 @@ use ibapi::accounts::PositionUpdate as IbPositionUpdate;
 use ibapi::contracts::Contract;
 use ibapi::market_data::historical::HistoricalBarUpdate;
 use ibapi::market_data::realtime::BidAsk;
-use ibapi::orders::{Action, OrderBuilder, OrderStatus as IbOrderStatus, PlaceOrder as IbPlaceOrder};
+use ibapi::orders::{Action, OrderBuilder, PlaceOrder as IbPlaceOrder};
 use ibapi::prelude::*;
+use order::{map_ibkr_to_event, OrderEvent, OrderStateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -106,6 +109,37 @@ struct OrderUpdate {
     filled: f64,
     remaining: f64,
     average_fill_price: f64,
+}
+
+/// Immutable order metadata used to reconstruct `OrderUpdate` from the state machine.
+#[derive(Clone, Debug)]
+struct OrderStaticFields {
+    symbol: String,
+    action: String,
+    order_type: String,
+    quantity: f64,
+    limit_price: Option<f64>,
+    stop_price: Option<f64>,
+}
+
+fn build_order_update(
+    order_id: i32,
+    sf: &OrderStaticFields,
+    sm: &OrderStateMachine,
+) -> OrderUpdate {
+    OrderUpdate {
+        order_id,
+        symbol: sf.symbol.clone(),
+        action: sf.action.clone(),
+        order_type: sf.order_type.clone(),
+        quantity: sf.quantity,
+        limit_price: sf.limit_price,
+        stop_price: sf.stop_price,
+        status: sm.state.as_str().to_string(),
+        filled: sm.filled,
+        remaining: sm.remaining,
+        average_fill_price: sm.avg_fill_price,
+    }
 }
 
 /// Single enum for all server→client messages so one broadcast channel carries everything.
@@ -609,100 +643,77 @@ async fn subscription_manager(
                     req.limit_price.map(|p| format!("@ {p}")).unwrap_or_default()
                 );
 
-                // Seed the cache so clients see the order immediately.
-                let initial_update = OrderUpdate {
-                    order_id,
+                let static_fields = OrderStaticFields {
                     symbol: req.symbol.clone(),
                     action: req.action.clone(),
                     order_type: req.order_type.clone(),
                     quantity: req.quantity,
                     limit_price: req.limit_price,
                     stop_price: req.stop_price,
-                    status: "PendingSubmit".to_string(),
-                    filled: 0.0,
-                    remaining: req.quantity,
-                    average_fill_price: 0.0,
                 };
-                order_cache.write().await.insert(order_id, initial_update.clone());
-                let _ = msg_tx.send(ServerMessage::OrderUpdate(initial_update));
+
+                // Initialize state machine: Unsent → PendingAck.
+                let mut sm = OrderStateMachine::new(order_id, req.quantity);
+                let _ = sm.apply(OrderEvent::Submit);
+
+                let update = build_order_update(order_id, &static_fields, &sm);
+                order_cache.write().await.insert(order_id, update.clone());
+                let _ = msg_tx.send(ServerMessage::OrderUpdate(update));
 
                 let client_ord = client.clone();
                 let msg_tx_ord = msg_tx.clone();
                 let order_cache_ord = order_cache.clone();
-                let symbol_ord = req.symbol.clone();
-                let action_str = req.action.clone();
-                let order_type_str = req.order_type.clone();
-                let quantity = req.quantity;
-                let limit_price = req.limit_price;
-                let stop_price = req.stop_price;
 
                 tokio::spawn(async move {
                     match client_ord.place_order(order_id, &contract, &order).await {
                         Ok(mut subscription) => {
                             while let Some(result) = subscription.next().await {
                                 match result {
-                                    Ok(IbPlaceOrder::OrderStatus(IbOrderStatus {
-                                        status,
-                                        filled,
-                                        remaining,
-                                        average_fill_price,
-                                        ..
-                                    })) => {
-                                        let update = OrderUpdate {
-                                            order_id,
-                                            symbol: symbol_ord.clone(),
-                                            action: action_str.clone(),
-                                            order_type: order_type_str.clone(),
-                                            quantity,
-                                            limit_price,
-                                            stop_price,
-                                            status: status.clone(),
-                                            filled,
-                                            remaining,
-                                            average_fill_price,
-                                        };
-                                        order_cache_ord.write().await.insert(order_id, update.clone());
-                                        let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
-                                        info!("Order #{order_id} {symbol_ord}: {status} (filled {filled}, remaining {remaining})");
-                                    }
-                                    Ok(IbPlaceOrder::ExecutionData(exec)) => {
-                                        info!(
-                                            "Order #{order_id} {symbol_ord}: execution {} shares @ {}",
-                                            exec.execution.shares, exec.execution.price
-                                        );
-                                    }
-                                    Ok(IbPlaceOrder::CommissionReport(cr)) => {
-                                        debug!(
-                                            "Order #{order_id}: commission {}",
-                                            cr.commission
-                                        );
-                                    }
-                                    Ok(IbPlaceOrder::OpenOrder(_)) => {}
-                                    Ok(IbPlaceOrder::Message(notice)) => {
-                                        info!("Order #{order_id} notice: {notice}");
+                                    Ok(ref ibkr_event) => {
+                                        // Audit logging for non-state events.
+                                        match ibkr_event {
+                                            IbPlaceOrder::ExecutionData(exec) => {
+                                                info!(
+                                                    "Order #{order_id} {}: execution {} shares @ {}",
+                                                    static_fields.symbol, exec.execution.shares, exec.execution.price
+                                                );
+                                            }
+                                            IbPlaceOrder::CommissionReport(cr) => {
+                                                debug!("Order #{order_id}: commission {}", cr.commission);
+                                            }
+                                            IbPlaceOrder::Message(notice) => {
+                                                info!("Order #{order_id} notice: {notice}");
+                                            }
+                                            _ => {}
+                                        }
+
+                                        if let Some(event) = map_ibkr_to_event(ibkr_event) {
+                                            if sm.apply(event).is_ok() {
+                                                let update = build_order_update(order_id, &static_fields, &sm);
+                                                order_cache_ord.write().await.insert(order_id, update.clone());
+                                                let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         error!("Order #{order_id} error: {e}");
+                                        let _ = sm.apply(OrderEvent::AckReject {
+                                            reason: e.to_string(),
+                                        });
+                                        let update = build_order_update(order_id, &static_fields, &sm);
+                                        order_cache_ord.write().await.insert(order_id, update.clone());
+                                        let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
                                         break;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            error!("Failed to place order #{order_id} for {symbol_ord}: {e}");
-                            let update = OrderUpdate {
-                                order_id,
-                                symbol: symbol_ord,
-                                action: action_str,
-                                order_type: order_type_str,
-                                quantity,
-                                limit_price,
-                                stop_price,
-                                status: format!("Error: {e}"),
-                                filled: 0.0,
-                                remaining: quantity,
-                                average_fill_price: 0.0,
-                            };
+                            error!("Failed to place order #{order_id} for {}: {e}", static_fields.symbol);
+                            let _ = sm.apply(OrderEvent::AckReject {
+                                reason: e.to_string(),
+                            });
+                            let update = build_order_update(order_id, &static_fields, &sm);
                             order_cache_ord.write().await.insert(order_id, update.clone());
                             let _ = msg_tx_ord.send(ServerMessage::OrderUpdate(update));
                         }
