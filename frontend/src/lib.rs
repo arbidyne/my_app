@@ -79,6 +79,11 @@ struct SubscribeRequest {
     security_type: String,
     exchange: String,
     currency: String,
+    primary_exchange: String,
+    last_trade_date_or_contract_month: String,
+    strike: f64,
+    right: String,
+    contract_id: i32,
 }
 
 #[derive(Serialize)]
@@ -527,6 +532,11 @@ fn App() -> impl IntoView {
     let sec_type_input = RwSignal::new("STK".to_string());
     let exchange_input = RwSignal::new("SMART".to_string());
     let currency_input = RwSignal::new("USD".to_string());
+    let primary_exchange_input = RwSignal::new(String::new());
+    let contract_month_input = RwSignal::new(String::new());
+    let strike_input = RwSignal::new(String::new());
+    let right_input = RwSignal::new(String::new());
+    let contract_id_input = RwSignal::new(String::new());
 
     // Store WebSocket reference for sending messages.
     // SendWrapper is safe because WASM is single-threaded; it satisfies the Send bound
@@ -660,6 +670,11 @@ fn App() -> impl IntoView {
             security_type: sec_type_input.get(),
             exchange: exchange_input.get().trim().to_uppercase(),
             currency: currency_input.get().trim().to_uppercase(),
+            primary_exchange: primary_exchange_input.get().trim().to_uppercase(),
+            last_trade_date_or_contract_month: contract_month_input.get().trim().to_string(),
+            strike: strike_input.get().trim().parse().unwrap_or(0.0),
+            right: right_input.get().trim().to_uppercase(),
+            contract_id: contract_id_input.get().trim().parse().unwrap_or(0),
         };
         if let Ok(json) = serde_json::to_string(&req) {
             if let Some(ws) = ws_ref_submit.borrow().as_ref() {
@@ -667,6 +682,11 @@ fn App() -> impl IntoView {
             }
         }
         symbol_input.set(String::new());
+        primary_exchange_input.set(String::new());
+        contract_month_input.set(String::new());
+        strike_input.set(String::new());
+        right_input.set(String::new());
+        contract_id_input.set(String::new());
     };
 
     // Sorted symbol list — only changes when a new contract is added/removed.
@@ -738,6 +758,61 @@ fn App() -> impl IntoView {
                             type="text"
                             prop:value=move || currency_input.get()
                             on:input=move |e| currency_input.set(event_target_value(&e))
+                            style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
+                        />
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-top: 10px;">
+                    <div style="flex: 1; min-width: 90px;">
+                        <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Primary Exch"</label>
+                        <input
+                            type="text"
+                            placeholder="e.g. ASX"
+                            prop:value=move || primary_exchange_input.get()
+                            on:input=move |e| primary_exchange_input.set(event_target_value(&e))
+                            style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
+                        />
+                    </div>
+                    <div style="flex: 1; min-width: 110px;">
+                        <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Contract Month"</label>
+                        <input
+                            type="text"
+                            placeholder="YYYYMM"
+                            prop:value=move || contract_month_input.get()
+                            on:input=move |e| contract_month_input.set(event_target_value(&e))
+                            style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
+                        />
+                    </div>
+                    <div style="min-width: 80px;">
+                        <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Strike"</label>
+                        <input
+                            type="number"
+                            step="0.01"
+                            placeholder="0.00"
+                            prop:value=move || strike_input.get()
+                            on:input=move |e| strike_input.set(event_target_value(&e))
+                            style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
+                        />
+                    </div>
+                    <div style="min-width: 70px;">
+                        <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Right"</label>
+                        <select
+                            prop:value=move || right_input.get()
+                            on:change=move |e| right_input.set(event_target_value(&e))
+                            style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; background: #fff; box-sizing: border-box;"
+                        >
+                            <option value="">"—"</option>
+                            <option value="C">"Call"</option>
+                            <option value="P">"Put"</option>
+                        </select>
+                    </div>
+                    <div style="min-width: 80px;">
+                        <label style="display: block; font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Con ID"</label>
+                        <input
+                            type="number"
+                            placeholder="optional"
+                            prop:value=move || contract_id_input.get()
+                            on:input=move |e| contract_id_input.set(event_target_value(&e))
                             style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.95em; box-sizing: border-box;"
                         />
                     </div>

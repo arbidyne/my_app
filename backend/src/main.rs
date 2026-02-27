@@ -97,15 +97,31 @@ struct ContractKey {
     security_type: String,
     exchange: String,
     currency: String,
+    last_trade_date_or_contract_month: String,
+    strike: String, // f64 stored as String for Hash/Eq
+    right: String,
+    contract_id: i32,
 }
 
-/// Mirrors the four fields IBKR requires to identify a contract.
+/// Fields IBKR needs to identify a contract. The base four (symbol, security_type,
+/// exchange, currency) suffice for stocks/forex; the optional fields enable futures
+/// and options where expiry, strike, and right are required for disambiguation.
 #[derive(Clone, Debug, Deserialize)]
 struct SubscribeRequest {
     symbol: String,
     security_type: String,
     exchange: String,
     currency: String,
+    #[serde(default)]
+    primary_exchange: String,
+    #[serde(default)]
+    last_trade_date_or_contract_month: String,
+    #[serde(default)]
+    strike: f64,
+    #[serde(default)]
+    right: String,
+    #[serde(default)]
+    contract_id: i32,
 }
 
 /// `RequestBars` exists as a fallback for clients that connect before bar data is cached.
@@ -233,6 +249,11 @@ async fn subscription_manager(
                                 security_type: pos.contract.security_type.to_string(),
                                 exchange: pos.contract.exchange.0.clone(),
                                 currency: pos.contract.currency.0.clone(),
+                                primary_exchange: pos.contract.primary_exchange.0.clone(),
+                                last_trade_date_or_contract_month: pos.contract.last_trade_date_or_contract_month.clone(),
+                                strike: pos.contract.strike,
+                                right: pos.contract.right.clone(),
+                                contract_id: pos.contract.contract_id,
                             }).await;
                             debug!("Position update: {symbol}");
                         }
@@ -260,6 +281,10 @@ async fn subscription_manager(
             security_type: req.security_type.clone(),
             exchange: req.exchange.clone(),
             currency: req.currency.clone(),
+            last_trade_date_or_contract_month: req.last_trade_date_or_contract_month.clone(),
+            strike: req.strike.to_string(),
+            right: req.right.clone(),
+            contract_id: req.contract_id,
         };
 
         if !subscribed.insert(key) {
@@ -290,10 +315,15 @@ async fn subscription_manager(
         }
 
         let contract = Contract {
+            contract_id: req.contract_id,
             symbol: Symbol(req.symbol.clone()),
             security_type: SecurityType::from(req.security_type.as_str()),
             exchange: Exchange(req.exchange),
             currency: Currency(req.currency),
+            primary_exchange: Exchange(req.primary_exchange),
+            last_trade_date_or_contract_month: req.last_trade_date_or_contract_month,
+            strike: req.strike,
+            right: req.right,
             ..Default::default()
         };
         let symbol = req.symbol.clone();
