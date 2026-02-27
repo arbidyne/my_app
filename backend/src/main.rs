@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 /// Decoupled from ibapi's `Bar` so we control serde serialization and normalize
 /// timestamps to milliseconds (JS/frontend convention).
@@ -71,6 +72,8 @@ struct ContractConfig {
 /// Client-submitted order with contract identification and order parameters.
 #[derive(Clone, Debug, Deserialize)]
 struct OrderRequest {
+    #[serde(default = "Uuid::new_v4")]
+    client_order_id: Uuid,
     symbol: String,
     security_type: String,
     exchange: String,
@@ -99,7 +102,7 @@ struct OrderRequest {
 /// Client-submitted modification: updates quantity and/or prices for an existing order.
 #[derive(Clone, Debug, Deserialize)]
 struct ModifyOrderRequest {
-    order_id: i32,
+    client_order_id: Uuid,
     quantity: f64,
     #[serde(default)]
     limit_price: Option<f64>,
@@ -110,6 +113,7 @@ struct ModifyOrderRequest {
 /// Tracks order lifecycle from submission through fill/cancel.
 #[derive(Clone, Debug, Serialize)]
 struct OrderUpdate {
+    client_order_id: Uuid,
     order_id: i32,
     symbol: String,
     action: String,
@@ -127,6 +131,7 @@ struct OrderUpdate {
 /// rebuild IBKR orders on modification.
 #[derive(Clone, Debug)]
 struct OrderStaticFields {
+    client_order_id: Uuid,
     symbol: String,
     action: String,
     order_type: String,
@@ -142,6 +147,7 @@ fn build_order_update(
     sm: &OrderStateMachine,
 ) -> OrderUpdate {
     OrderUpdate {
+        client_order_id: sf.client_order_id,
         order_id,
         symbol: sf.symbol.clone(),
         action: sf.action.clone(),
@@ -160,7 +166,7 @@ fn build_order_update(
 /// subscription manager (which owns the ibapi Client) processes them sequentially.
 enum OrderCommand {
     Place(OrderRequest),
-    Cancel { order_id: i32 },
+    Cancel { client_order_id: Uuid },
     Modify(ModifyOrderRequest),
 }
 
@@ -244,7 +250,7 @@ enum ClientMessage {
     RequestBars { symbol: String },
     UpdateContractConfig(ContractConfig),
     PlaceOrder(OrderRequest),
-    CancelOrder { order_id: i32 },
+    CancelOrder { client_order_id: Uuid },
     ModifyOrder(ModifyOrderRequest),
 }
 
@@ -409,6 +415,9 @@ async fn subscription_manager(
 
     let mut subscribed: HashSet<ContractKey> = HashSet::new();
     let order_store: OrderStore = Arc::new(RwLock::new(HashMap::new()));
+    // Reverse lookup: client_order_id → IBKR order_id, so cancel/modify can resolve by UUID.
+    let client_id_to_order_id: Arc<RwLock<HashMap<Uuid, i32>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -681,6 +690,7 @@ async fn subscription_manager(
                         );
 
                         let static_fields = OrderStaticFields {
+                            client_order_id: req.client_order_id,
                             symbol: req.symbol.clone(),
                             action: req.action.clone(),
                             order_type: req.order_type.clone(),
@@ -689,6 +699,8 @@ async fn subscription_manager(
                             stop_price: req.stop_price,
                             time_in_force: tif,
                         };
+
+                        client_id_to_order_id.write().await.insert(req.client_order_id, order_id);
 
                         let mut sm = OrderStateMachine::new(order_id, req.quantity);
                         let _ = sm.apply(OrderEvent::Submit);
@@ -712,7 +724,14 @@ async fn subscription_manager(
                             msg_tx.clone(),
                         );
                     }
-                    OrderCommand::Cancel { order_id } => {
+                    OrderCommand::Cancel { client_order_id } => {
+                        let order_id = match client_id_to_order_id.read().await.get(&client_order_id) {
+                            Some(&id) => id,
+                            None => {
+                                info!("Cancel: client_order_id {client_order_id} not found in lookup");
+                                continue;
+                            }
+                        };
                         // Validate order exists and is not terminal.
                         {
                             let mut store = order_store.write().await;
@@ -773,10 +792,17 @@ async fn subscription_manager(
                         });
                     }
                     OrderCommand::Modify(req) => {
+                        let order_id = match client_id_to_order_id.read().await.get(&req.client_order_id) {
+                            Some(&id) => id,
+                            None => {
+                                info!("Modify: client_order_id {} not found in lookup", req.client_order_id);
+                                continue;
+                            }
+                        };
                         let sf_snapshot;
                         {
                             let mut store = order_store.write().await;
-                            match store.get_mut(&req.order_id) {
+                            match store.get_mut(&order_id) {
                                 Some(entry) if matches!(entry.sm.state, order::OrderState::Working | order::OrderState::PartiallyFilled) => {
                                     if entry.sm.apply(OrderEvent::AmendRequested).is_ok() {
                                         // Update static fields with new values.
@@ -787,8 +813,8 @@ async fn subscription_manager(
                                         if req.stop_price.is_some() {
                                             entry.static_fields.stop_price = req.stop_price;
                                         }
-                                        let update = build_order_update(req.order_id, &entry.static_fields, &entry.sm);
-                                        order_cache.write().await.insert(req.order_id, update.clone());
+                                        let update = build_order_update(order_id, &entry.static_fields, &entry.sm);
+                                        order_cache.write().await.insert(order_id, update.clone());
                                         let _ = msg_tx.send(ServerMessage::OrderUpdate(update));
                                         sf_snapshot = entry.static_fields.clone();
                                     } else {
@@ -796,11 +822,11 @@ async fn subscription_manager(
                                     }
                                 }
                                 Some(entry) => {
-                                    info!("Order #{}: ignoring modify — state is {}", req.order_id, entry.sm.state.as_str());
+                                    info!("Order #{order_id}: ignoring modify — state is {}", entry.sm.state.as_str());
                                     continue;
                                 }
                                 None => {
-                                    info!("Order #{}: ignoring modify — not found", req.order_id);
+                                    info!("Order #{order_id}: ignoring modify — not found");
                                     continue;
                                 }
                             }
@@ -810,7 +836,7 @@ async fn subscription_manager(
                         let contract = match contract_cache.read().await.get(&sf_snapshot.symbol) {
                             Some(c) => c.clone(),
                             None => {
-                                error!("Order #{}: cannot modify — contract for {} not in cache", req.order_id, sf_snapshot.symbol);
+                                error!("Order #{order_id}: cannot modify — contract for {} not in cache", sf_snapshot.symbol);
                                 continue;
                             }
                         };
@@ -838,19 +864,19 @@ async fn subscription_manager(
                         let modified_order = match builder.build() {
                             Ok(o) => o,
                             Err(e) => {
-                                error!("Failed to build modified order #{}: {e}", req.order_id);
+                                error!("Failed to build modified order #{order_id}: {e}");
                                 continue;
                             }
                         };
 
                         info!(
-                            "Modifying order #{} — qty={} limit={:?} stop={:?}",
-                            req.order_id, sf_snapshot.quantity, sf_snapshot.limit_price, sf_snapshot.stop_price
+                            "Modifying order #{order_id} — qty={} limit={:?} stop={:?}",
+                            sf_snapshot.quantity, sf_snapshot.limit_price, sf_snapshot.stop_price
                         );
 
                         // Same order_id replaces the old subscription in ibapi's message bus.
                         spawn_order_monitor(
-                            req.order_id,
+                            order_id,
                             &client,
                             &contract,
                             &modified_order,
@@ -1081,15 +1107,15 @@ async fn handle_socket(
                                 let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
                             }
                             Ok(ClientMessage::PlaceOrder(req)) => {
-                                info!("Client order request: {} {} {} x {}", req.action, req.order_type, req.quantity, req.symbol);
+                                info!("Client order request: {} {} {} x {} (client_order_id={})", req.action, req.order_type, req.quantity, req.symbol, req.client_order_id);
                                 let _ = order_tx.send(OrderCommand::Place(req)).await;
                             }
-                            Ok(ClientMessage::CancelOrder { order_id }) => {
-                                info!("Client cancel request: order #{order_id}");
-                                let _ = order_tx.send(OrderCommand::Cancel { order_id }).await;
+                            Ok(ClientMessage::CancelOrder { client_order_id }) => {
+                                info!("Client cancel request: client_order_id={client_order_id}");
+                                let _ = order_tx.send(OrderCommand::Cancel { client_order_id }).await;
                             }
                             Ok(ClientMessage::ModifyOrder(req)) => {
-                                info!("Client modify request: order #{} qty={} limit={:?} stop={:?}", req.order_id, req.quantity, req.limit_price, req.stop_price);
+                                info!("Client modify request: client_order_id={} qty={} limit={:?} stop={:?}", req.client_order_id, req.quantity, req.limit_price, req.stop_price);
                                 let _ = order_tx.send(OrderCommand::Modify(req)).await;
                             }
                             Err(e) => {

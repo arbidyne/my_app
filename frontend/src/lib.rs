@@ -5,6 +5,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
@@ -95,6 +96,7 @@ struct RequestBarsMsg {
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 struct OrderUpdate {
+    client_order_id: Uuid,
     order_id: i32,
     symbol: String,
     action: String,
@@ -111,6 +113,7 @@ struct OrderUpdate {
 #[derive(Serialize)]
 struct PlaceOrderMsg {
     r#type: String,
+    client_order_id: Uuid,
     symbol: String,
     security_type: String,
     exchange: String,
@@ -131,13 +134,13 @@ struct PlaceOrderMsg {
 #[derive(Serialize)]
 struct CancelOrderMsg {
     r#type: String,
-    order_id: i32,
+    client_order_id: Uuid,
 }
 
 #[derive(Serialize)]
 struct ModifyOrderMsg {
     r#type: String,
-    order_id: i32,
+    client_order_id: Uuid,
     quantity: f64,
     limit_price: Option<f64>,
     stop_price: Option<f64>,
@@ -391,7 +394,7 @@ fn ContractRow(
     bar_history: RwSignal<HashMap<String, Vec<BarData>>>,
     positions: RwSignal<HashMap<String, PositionData>>,
     configs: RwSignal<HashMap<String, ContractConfig>>,
-    orders: RwSignal<HashMap<i32, OrderUpdate>>,
+    orders: RwSignal<HashMap<Uuid, OrderUpdate>>,
     ws_ref: SendWrapper<Rc<RefCell<Option<WebSocket>>>>,
 ) -> impl IntoView {
     let sym_for_price = symbol.clone();
@@ -587,17 +590,33 @@ fn ContractRow(
                 let ot = order_type.get();
                 let lp = order_limit.get().parse::<f64>().ok();
                 let sp = order_stop.get().parse::<f64>().ok();
+                let act = order_action.get();
 
-                // Look up contract details from the subscription's price data
-                // We need the contract fields — for now use reasonable defaults
-                // matching the subscription form. The configs store the symbol.
-                let price_data = prices.get();
-                let _ = price_data.get(&sym_submit);
+                let client_order_id = Uuid::new_v4();
 
-                // Get contract details from the config/subscription context.
-                // We send the symbol and let the backend match the subscribed contract.
+                // Optimistic UI: insert a PendingAck row immediately so the user
+                // sees feedback before the backend round-trip completes.
+                let optimistic = OrderUpdate {
+                    client_order_id,
+                    order_id: 0,
+                    symbol: sym_submit.clone(),
+                    action: act.clone(),
+                    order_type: ot.clone(),
+                    quantity: qty,
+                    limit_price: lp,
+                    stop_price: sp,
+                    status: "PendingAck".to_string(),
+                    filled: 0.0,
+                    remaining: qty,
+                    average_fill_price: 0.0,
+                };
+                orders.update(|map| {
+                    map.insert(client_order_id, optimistic);
+                });
+
                 let msg = PlaceOrderMsg {
                     r#type: "place_order".to_string(),
+                    client_order_id,
                     symbol: sym_submit.clone(),
                     security_type: String::new(),
                     exchange: String::new(),
@@ -607,7 +626,7 @@ fn ContractRow(
                     strike: 0.0,
                     right: String::new(),
                     contract_id: 0,
-                    action: order_action.get(),
+                    action: act,
                     order_type: ot,
                     quantity: qty,
                     limit_price: lp,
@@ -709,7 +728,7 @@ fn ContractRow(
         {
             let sym = sym_for_orders;
             let ws_orders = ws_ref;
-            let editing_order_id: RwSignal<Option<i32>> = RwSignal::new(None);
+            let editing_order_id: RwSignal<Option<Uuid>> = RwSignal::new(None);
             let edit_qty = RwSignal::new(String::new());
             let edit_price = RwSignal::new(String::new());
 
@@ -720,6 +739,7 @@ fn ContractRow(
                     .cloned()
                     .collect();
                 contract_orders.sort_by(|a, b| b.order_id.cmp(&a.order_id));
+
                 if contract_orders.is_empty() {
                     view! { <div></div> }.into_any()
                 } else {
@@ -758,7 +778,7 @@ fn ContractRow(
                                         let can_modify = matches!(o.status.as_str(), "Working" | "PartiallyFilled")
                                             && matches!(o.order_type.as_str(), "LMT" | "STP");
 
-                                        let is_editing = editing_order_id.get() == Some(o.order_id);
+                                        let is_editing = editing_order_id.get() == Some(o.client_order_id);
 
                                         // Qty cell: show input when editing, text otherwise
                                         let qty_display = if is_editing {
@@ -805,7 +825,7 @@ fn ContractRow(
                                         };
 
                                         // Actions cell
-                                        let oid = o.order_id;
+                                        let coid = o.client_order_id;
                                         let o_type = o.order_type.clone();
                                         let o_qty = o.quantity;
                                         let o_lp = o.limit_price;
@@ -825,7 +845,7 @@ fn ContractRow(
                                                 };
                                                 let msg = ModifyOrderMsg {
                                                     r#type: "modify_order".to_string(),
-                                                    order_id: oid,
+                                                    client_order_id: coid,
                                                     quantity: qty,
                                                     limit_price: lp,
                                                     stop_price: sp,
@@ -857,7 +877,7 @@ fn ContractRow(
                                             let on_cancel = move |_| {
                                                 let msg = CancelOrderMsg {
                                                     r#type: "cancel_order".to_string(),
-                                                    order_id: oid,
+                                                    client_order_id: coid,
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&msg) {
                                                     if let Some(ws) = ws_cancel.borrow().as_ref() {
@@ -873,7 +893,7 @@ fn ContractRow(
                                                     _ => String::new(),
                                                 };
                                                 edit_price.set(price_str);
-                                                editing_order_id.set(Some(oid));
+                                                editing_order_id.set(Some(coid));
                                             };
                                             view! {
                                                 <td style="padding: 4px 8px; white-space: nowrap;">
@@ -903,7 +923,13 @@ fn ContractRow(
 
                                         view! {
                                             <tr style="border-bottom: 1px solid #f3f4f6;">
-                                                <td style="padding: 4px 8px;">{o.order_id}</td>
+                                                <td style="padding: 4px 8px;">{
+                                                    if o.order_id > 0 {
+                                                        o.order_id.to_string()
+                                                    } else {
+                                                        o.client_order_id.to_string()[..8].to_string()
+                                                    }
+                                                }</td>
                                                 <td style="padding: 4px 8px; font-weight: 600;">{o.action.clone()}</td>
                                                 <td style="padding: 4px 8px;">{o.order_type.clone()}</td>
                                                 {qty_display}
@@ -931,7 +957,7 @@ fn App() -> impl IntoView {
     let bar_history: RwSignal<HashMap<String, Vec<BarData>>> = RwSignal::new(HashMap::new());
     let positions: RwSignal<HashMap<String, PositionData>> = RwSignal::new(HashMap::new());
     let configs: RwSignal<HashMap<String, ContractConfig>> = RwSignal::new(HashMap::new());
-    let orders: RwSignal<HashMap<i32, OrderUpdate>> = RwSignal::new(HashMap::new());
+    let orders: RwSignal<HashMap<Uuid, OrderUpdate>> = RwSignal::new(HashMap::new());
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -1012,7 +1038,7 @@ fn App() -> impl IntoView {
                     }
                     Ok(ServerMessage::OrderUpdate(update)) => {
                         orders.update(|map| {
-                            map.insert(update.order_id, update);
+                            map.insert(update.client_order_id, update);
                         });
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
