@@ -11,6 +11,7 @@
 //! client receive all messages independently without per-client send logic.
 
 mod order;
+mod risk;
 
 use anyhow::Result;
 use axum::{
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Decoupled from ibapi's `Bar` so we control serde serialization and normalize
@@ -651,6 +652,40 @@ async fn subscription_manager(
                                 ..Default::default()
                             }
                         };
+
+                        // --- Pre-trade risk check ---
+                        let risk_result = {
+                            let cfg = config_cache.read().await;
+                            let pos = position_cache.read().await;
+                            match cfg.get(&req.symbol) {
+                                Some(contract_cfg) => {
+                                    let current = pos.get(&req.symbol)
+                                        .map(|p| p.position_size).unwrap_or(0.0);
+                                    risk::check_risk(&req.action, req.quantity, contract_cfg, current)
+                                }
+                                None => Err("No risk config for this contract".to_string()),
+                            }
+                        };
+                        if let Err(reason) = risk_result {
+                            warn!("Risk check failed for {}: {reason}", req.symbol);
+                            let static_fields = OrderStaticFields {
+                                client_order_id: req.client_order_id,
+                                symbol: req.symbol.clone(),
+                                action: req.action.clone(),
+                                order_type: req.order_type.clone(),
+                                quantity: req.quantity,
+                                limit_price: req.limit_price,
+                                stop_price: req.stop_price,
+                                time_in_force: if req.time_in_force.is_empty() { "DAY".to_string() } else { req.time_in_force.clone() },
+                            };
+                            let mut sm = OrderStateMachine::new(0, req.quantity);
+                            let _ = sm.apply(OrderEvent::Submit);
+                            let _ = sm.apply(OrderEvent::AckReject { reason });
+                            let update = build_order_update(0, &static_fields, &sm);
+                            order_cache.write().await.insert(0, update.clone());
+                            let _ = msg_tx.send(ServerMessage::OrderUpdate(update));
+                            continue;
+                        }
 
                         let action = match req.action.to_uppercase().as_str() {
                             "SELL" => Action::Sell,
