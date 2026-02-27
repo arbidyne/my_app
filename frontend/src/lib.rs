@@ -296,7 +296,7 @@ fn TradingStateControl(
 }
 
 #[component]
-fn PriceCard(price: PriceUpdate, position: Option<PositionData>) -> impl IntoView {
+fn PriceCard(price: PriceUpdate, position: Option<PositionData>, config: Option<ContractConfig>) -> impl IntoView {
     let ts_secs = (price.timestamp / 1000) as f64;
     let date = js_sys::Date::new(&JsValue::from_f64(ts_secs * 1000.0));
     let time_str = format!(
@@ -313,6 +313,13 @@ fn PriceCard(price: PriceUpdate, position: Option<PositionData>) -> impl IntoVie
         } else {
             format!("{:+}", pos.position_size)
         };
+
+        let multiplier = config.as_ref().map_or(1.0, |c| c.multiplier);
+        let notional = price.last_price * multiplier * pos.position_size.abs();
+        let unrealized_pnl = (price.last_price - pos.average_cost) * pos.position_size * multiplier;
+        let pnl_color = if unrealized_pnl >= 0.0 { "#16a34a" } else { "#dc2626" };
+        let pnl_sign = if unrealized_pnl >= 0.0 { "+" } else { "" };
+
         view! {
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px;">
                 <div style="background: #f0f4ff; border-radius: 8px; padding: 12px;">
@@ -325,6 +332,18 @@ fn PriceCard(price: PriceUpdate, position: Option<PositionData>) -> impl IntoVie
                     <div style="font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Avg Cost"</div>
                     <div style="font-size: 1.25em; font-weight: 600; color: #333;">
                         {format!("{:.2}", pos.average_cost)}
+                    </div>
+                </div>
+                <div style="background: #f0f4ff; border-radius: 8px; padding: 12px;">
+                    <div style="font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Notional"</div>
+                    <div style="font-size: 1.25em; font-weight: 600; color: #333;">
+                        {format!("{:.2}", notional)}
+                    </div>
+                </div>
+                <div style="background: #f0f4ff; border-radius: 8px; padding: 12px;">
+                    <div style="font-size: 0.75em; color: #888; text-transform: uppercase; margin-bottom: 4px;">"Unrealized P&L"</div>
+                    <div style=format!("font-size: 1.25em; font-weight: 600; color: {pnl_color};")>
+                        {format!("{pnl_sign}{:.2}", unrealized_pnl)}
                     </div>
                 </div>
             </div>
@@ -529,7 +548,8 @@ fn ContractRow(
                 {move || {
                     prices.get().get(&sym_for_price).cloned().map(|p| {
                         let pos = positions.get().get(&sym_for_price).cloned();
-                        view! { <PriceCard price=p position=pos /> }
+                        let cfg = configs.get().get(&sym_for_price).cloned();
+                        view! { <PriceCard price=p position=pos config=cfg /> }
                     })
                 }}
             </div>

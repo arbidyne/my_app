@@ -9,9 +9,8 @@
 
 ## Phase 2 — Risk Management
 - ~~**Pre-trade risk checks** — enforce max_pos_size, max_order_size, min_pos_size before submitting.  All these checks should be done at the backend only.  Any failures should put the order into Rejected status and must not be submitted to IB.  Autotrade gate rejects orders when autotrade=false.  Zero limits mean "zero tolerance" (fail-closed).~~ **DONE**
-- ~~**Trading states** — Active / Halted / Reducing-only mode (global kill switch)~~ **DONE**
-- **Max notional limits** — cap dollar exposure per contract
-- **P&L tracking** — realized and unrealized P&L per position, displayed on price cards
+- ~~**Trading states** — Active / Halted / Reducing-only mode (global kill switch)~~ **DONE** 
+- ~~**P&L tracking (unrealized)** — unrealized P&L and notional value per position, displayed on price cards.  Notional = price × multiplier × |position_size|, unrealized P&L = (price − avg_cost) × position_size × multiplier.  Color-coded green/red.~~ **DONE** *(realized P&L requires fill tracking — follow-up)*
 - **Daily loss limit** — auto-halt trading if drawdown exceeds threshold
 - **Order Rate Limit Check** - build a rate limiter.  If more than 5 orders are sent in 2 seconds, the global kill switch should trigger and stop trading. The rates (number of orders and time window) will be hardcoded for now but later we will add them to global configuration.
 
