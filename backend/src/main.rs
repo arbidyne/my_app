@@ -10,12 +10,16 @@
 //! and fans out data to many browser clients via WebSocket. A broadcast channel lets each
 //! client receive all messages independently without per-client send logic.
 
+mod db;
 mod order;
 mod risk;
 mod runner;
+mod sim_gateway;
+mod sim_orders;
 mod strategy;
 
 use anyhow::Result;
+use clap::Parser;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
@@ -244,6 +248,10 @@ enum ServerMessage {
     TradingState {
         state: TradingState,
     },
+    BacktestComplete {
+        symbol: String,
+        total_bars: usize,
+    },
 }
 
 /// IBKR rejects duplicate subscriptions and charges per active subscription, so we dedup
@@ -310,11 +318,33 @@ struct AppState {
     strategy_tx: mpsc::Sender<runner::StrategyCommand>,
 }
 
+/// IBKR trading backend — live mode or backtest replay from SQLite.
+#[derive(Parser)]
+struct Args {
+    /// Run in backtest mode (replay historical bars from SQLite).
+    #[arg(long)]
+    backtest: bool,
+    /// Symbol to backtest (required with --backtest).
+    #[arg(long)]
+    symbol: Option<String>,
+    /// Start date for backtest (YYYY-MM-DD, inclusive).
+    #[arg(long)]
+    from: Option<String>,
+    /// End date for backtest (YYYY-MM-DD, inclusive).
+    #[arg(long)]
+    to: Option<String>,
+    /// Path to the SQLite bar database.
+    #[arg(long, default_value = "data/bars.db")]
+    db_path: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .init();
+
+    let args = Args::parse();
 
     // Broadcast (not mpsc) so each client gets its own receiver — fan-out without explicit per-client send logic.
     let (msg_tx, _) = broadcast::channel::<ServerMessage>(100);
@@ -351,20 +381,75 @@ async fn main() -> Result<()> {
     let trading_state: Arc<RwLock<TradingState>> =
         Arc::new(RwLock::new(TradingState::default()));
 
-    // Runs in a dedicated task so the HTTP server can start accepting connections immediately.
-    let msg_tx_clone = msg_tx.clone();
-    let bar_cache_clone = bar_cache.clone();
-    let position_cache_clone = position_cache.clone();
-    let config_cache_clone = config_cache.clone();
-    let order_cache_clone = order_cache.clone();
-    let contract_cache_clone = contract_cache.clone();
-    let subscribe_tx_clone = subscribe_tx.clone();
-    let trading_state_clone = trading_state.clone();
-    let order_tx_clone = order_tx.clone();
-    tokio::spawn(async move {
-        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone, trading_state_clone, order_tx_clone, strategy_rx)
+    if args.backtest {
+        let symbol = args.symbol.expect("--symbol is required with --backtest");
+        let from_str = args.from.expect("--from is required with --backtest");
+        let to_str = args.to.expect("--to is required with --backtest");
+
+        let from_date = chrono::NaiveDate::parse_from_str(&from_str, "%Y-%m-%d")
+            .expect("--from must be YYYY-MM-DD");
+        let to_date = chrono::NaiveDate::parse_from_str(&to_str, "%Y-%m-%d")
+            .expect("--to must be YYYY-MM-DD");
+
+        // Convert dates to millisecond timestamps (start of from_date, end of to_date).
+        let from_ms = from_date
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() as u64;
+        let to_ms = to_date
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() as u64;
+
+        info!("Starting backtest for {symbol} from {from_str} to {to_str}");
+
+        let bt_config = sim_gateway::BacktestConfig {
+            symbol,
+            from_ms,
+            to_ms,
+            db_path: args.db_path,
+        };
+
+        let msg_tx_clone = msg_tx.clone();
+        let bar_cache_clone = bar_cache.clone();
+        let position_cache_clone = position_cache.clone();
+        let config_cache_clone = config_cache.clone();
+        let order_cache_clone = order_cache.clone();
+        let trading_state_clone = trading_state.clone();
+        let order_tx_clone = order_tx.clone();
+        tokio::spawn(async move {
+            sim_gateway::sim_subscription_manager(
+                bt_config,
+                order_rx,
+                msg_tx_clone,
+                bar_cache_clone,
+                position_cache_clone,
+                config_cache_clone,
+                order_cache_clone,
+                trading_state_clone,
+                order_tx_clone,
+                strategy_rx,
+            )
             .await;
-    });
+        });
+    } else {
+        // Live mode — connect to IBKR.
+        let msg_tx_clone = msg_tx.clone();
+        let bar_cache_clone = bar_cache.clone();
+        let position_cache_clone = position_cache.clone();
+        let config_cache_clone = config_cache.clone();
+        let order_cache_clone = order_cache.clone();
+        let contract_cache_clone = contract_cache.clone();
+        let subscribe_tx_clone = subscribe_tx.clone();
+        let trading_state_clone = trading_state.clone();
+        let order_tx_clone = order_tx.clone();
+        tokio::spawn(async move {
+            subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone, trading_state_clone, order_tx_clone, strategy_rx)
+                .await;
+        });
+    }
 
     let state = AppState {
         msg_tx,
@@ -409,6 +494,14 @@ async fn subscription_manager(
         Ok(c) => Arc::new(c),
         Err(e) => {
             error!("Failed to connect to IB Gateway: {e}");
+            return;
+        }
+    };
+
+    let bar_db = match db::BarDb::open("data/bars.db") {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            error!("Failed to open bar database: {e}");
             return;
         }
     };
@@ -604,6 +697,7 @@ async fn subscription_manager(
                 let symbol_hist = symbol.clone();
                 let contract_hist = contract.clone();
                 let bar_cache_hist = bar_cache.clone();
+                let bar_db_hist = bar_db.clone();
                 tokio::spawn(async move {
                     match client_hist
                         .historical_data_streaming(
@@ -643,7 +737,14 @@ async fn subscription_manager(
                                             .insert(symbol_hist.clone(), bars.clone());
                                         let _ = msg_tx_hist.send(ServerMessage::HistoricalBars {
                                             symbol: symbol_hist.clone(),
-                                            bars,
+                                            bars: bars.clone(),
+                                        });
+                                        let db = bar_db_hist.clone();
+                                        let sym = symbol_hist.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            if let Err(e) = db.upsert_bars(&sym, &bars) {
+                                                tracing::error!("Failed to record historical bars: {e}");
+                                            }
                                         });
                                     }
                                     HistoricalBarUpdate::Update(bar) => {
@@ -675,7 +776,14 @@ async fn subscription_manager(
 
                                         let _ = msg_tx_hist.send(ServerMessage::RealtimeBar {
                                             symbol: symbol_hist.clone(),
-                                            bar: bar_data,
+                                            bar: bar_data.clone(),
+                                        });
+                                        let db = bar_db_hist.clone();
+                                        let sym = symbol_hist.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            if let Err(e) = db.upsert_bar(&sym, &bar_data) {
+                                                tracing::error!("Failed to record realtime bar: {e}");
+                                            }
                                         });
                                     }
                                     HistoricalBarUpdate::End { .. } => {

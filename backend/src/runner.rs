@@ -214,6 +214,7 @@ impl StrategyRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BarData;
     use crate::strategy::{self, PingStrategy};
 
     fn make_caches() -> (

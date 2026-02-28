@@ -63,6 +63,7 @@ enum ServerMessage {
     ContractConfig(ContractConfig),
     OrderUpdate(OrderUpdate),
     TradingState { state: TradingState },
+    BacktestComplete { symbol: String, total_bars: usize },
 }
 
 #[derive(Serialize)]
@@ -1135,6 +1136,7 @@ fn App() -> impl IntoView {
     let configs: RwSignal<HashMap<String, ContractConfig>> = RwSignal::new(HashMap::new());
     let orders: RwSignal<HashMap<Uuid, OrderUpdate>> = RwSignal::new(HashMap::new());
     let trading_state: RwSignal<TradingState> = RwSignal::new(TradingState::default());
+    let backtest_complete: RwSignal<Option<(String, usize)>> = RwSignal::new(None);
     let connected = RwSignal::new(false);
 
     // Form input signals with defaults
@@ -1220,6 +1222,14 @@ fn App() -> impl IntoView {
                     }
                     Ok(ServerMessage::TradingState { state }) => {
                         trading_state.set(state);
+                    }
+                    Ok(ServerMessage::BacktestComplete { symbol, total_bars }) => {
+                        leptos::logging::log!(
+                            "Backtest complete: {} bars replayed for {}",
+                            total_bars,
+                            symbol
+                        );
+                        backtest_complete.set(Some((symbol, total_bars)));
                     }
                     Err(err) => leptos::logging::log!("parse error: {err}"),
                 }
@@ -1333,6 +1343,20 @@ fn App() -> impl IntoView {
 
             // Trading state control
             <TradingStateControl trading_state=trading_state ws_ref=ws_ref.clone() />
+
+            // Backtest completion banner
+            {move || {
+                backtest_complete.get().map(|(symbol, total_bars)| {
+                    view! {
+                        <div style="background: #eff6ff; border: 1px solid #93c5fd; border-radius: 12px; padding: 14px 20px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px;">
+                            <span style="font-size: 1.2em;">"✓"</span>
+                            <span style="font-size: 0.95em; font-weight: 600; color: #1d4ed8;">
+                                {format!("Backtest complete — {symbol} — {total_bars} bars replayed")}
+                            </span>
+                        </div>
+                    }
+                })
+            }}
 
             // Subscription form
             <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin-bottom: 24px;">
