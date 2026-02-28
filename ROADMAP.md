@@ -15,10 +15,9 @@
 - ~~**Order Rate Limit Check** - build a rate limiter.  If more than 5 orders are sent in 2 seconds, the global kill switch should trigger and stop trading. The rates (number of orders and time window) will be hardcoded for now but later we will add them to global configuration.~~ **DONE**
 
 ## Phase 3 — Autotrader Framework
-- **Strategy trait/interface** — define a standard interface strategies implement (on_tick, on_bar, on_fill)
-- **Signal generation** — strategies emit buy/sell signals, routed through risk engine before execution
-- **TWAP execution algorithm** — split large orders across time intervals
-- **Per-contract strategy assignment** — bind a strategy to a contract via the config panel
+- ~~**Strategy trait/interface** — define a standard interface strategies implement (on_tick, on_bar, on_fill)~~ **DONE**
+- ~~**Signal generation** — strategies emit buy/sell signals, routed through risk engine before execution~~ **DONE**
+- ~~**Per-contract strategy assignment** — bind a strategy to a contract via the config panel~~ **DONE**
 - **Backtesting mode** — replay historical bars through the same strategy code (backtest-live parity)
 
 ## Phase 4 — Enhanced Market Data
