@@ -48,6 +48,8 @@ struct ContractConfig {
     max_order_size: u32,
     multiplier: f64,
     lot_size: u32,
+    #[serde(default)]
+    strategy: String,
 }
 
 /// Tagged enum matching the backend's ServerMessage.
@@ -73,6 +75,7 @@ struct UpdateContractConfigMsg {
     max_order_size: u32,
     multiplier: f64,
     lot_size: u32,
+    strategy: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -515,6 +518,7 @@ fn send_config_update(ws: &SendWrapper<Rc<RefCell<Option<WebSocket>>>>, cfg: &Co
         max_order_size: cfg.max_order_size,
         multiplier: cfg.multiplier,
         lot_size: cfg.lot_size,
+        strategy: cfg.strategy.clone(),
     };
     if let Ok(json) = serde_json::to_string(&msg) {
         if let Some(ws) = ws.borrow().as_ref() {
@@ -574,6 +578,18 @@ fn ContractRow(
                             if let Some(c) = map.get_mut(&sym_at) {
                                 c.autotrade = checked;
                                 send_config_update(&ws_at, c);
+                            }
+                        });
+                    };
+
+                    let ws_strat = ws.clone();
+                    let sym_strat = sym.clone();
+                    let on_strategy = move |e: web_sys::Event| {
+                        let val = event_target_value(&e);
+                        configs.update(|map| {
+                            if let Some(c) = map.get_mut(&sym_strat) {
+                                c.strategy = val;
+                                send_config_update(&ws_strat, c);
                             }
                         });
                     };
@@ -650,6 +666,17 @@ fn ContractRow(
                                         style="width: 16px; height: 16px; cursor: pointer;"
                                     />
                                     "Autotrade"
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 0.9em;">
+                                    "Strategy"
+                                    <select
+                                        prop:value=cfg.strategy.clone()
+                                        on:change=on_strategy
+                                        style="padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9em; background: #fff;"
+                                    >
+                                        <option value="none" selected=cfg.strategy == "none">"None"</option>
+                                        <option value="ping" selected=cfg.strategy == "ping">"Ping (test)"</option>
+                                    </select>
                                 </label>
                             </div>
                             <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px;">

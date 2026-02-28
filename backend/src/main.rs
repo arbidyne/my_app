@@ -12,6 +12,8 @@
 
 mod order;
 mod risk;
+mod runner;
+mod strategy;
 
 use anyhow::Result;
 use axum::{
@@ -32,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -69,6 +72,12 @@ struct ContractConfig {
     max_order_size: u32,
     multiplier: f64,
     lot_size: u32,
+    #[serde(default = "default_strategy")]
+    strategy: String,
+}
+
+fn default_strategy() -> String {
+    "none".into()
 }
 
 /// Global kill switch that overrides per-contract `autotrade` settings.
@@ -298,6 +307,7 @@ struct AppState {
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
     trading_state: Arc<RwLock<TradingState>>,
+    strategy_tx: mpsc::Sender<runner::StrategyCommand>,
 }
 
 #[tokio::main]
@@ -314,6 +324,9 @@ async fn main() -> Result<()> {
 
     // Order requests funneled to the subscription manager where the ibapi Client lives.
     let (order_tx, order_rx) = mpsc::channel::<OrderCommand>(32);
+
+    // Strategy change commands from handle_socket → subscription_manager.
+    let (strategy_tx, strategy_rx) = mpsc::channel::<runner::StrategyCommand>(32);
 
     // Cached server-side so clients connecting after the initial broadcast still get full bar history.
     let bar_cache: Arc<RwLock<HashMap<String, Vec<BarData>>>> =
@@ -347,8 +360,9 @@ async fn main() -> Result<()> {
     let contract_cache_clone = contract_cache.clone();
     let subscribe_tx_clone = subscribe_tx.clone();
     let trading_state_clone = trading_state.clone();
+    let order_tx_clone = order_tx.clone();
     tokio::spawn(async move {
-        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone, trading_state_clone)
+        subscription_manager(subscribe_rx, subscribe_tx_clone, order_rx, msg_tx_clone, bar_cache_clone, position_cache_clone, config_cache_clone, order_cache_clone, contract_cache_clone, trading_state_clone, order_tx_clone, strategy_rx)
             .await;
     });
 
@@ -361,6 +375,7 @@ async fn main() -> Result<()> {
         config_cache,
         order_cache,
         trading_state,
+        strategy_tx,
     };
 
     let app = Router::new()
@@ -387,6 +402,8 @@ async fn subscription_manager(
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
     contract_cache: Arc<RwLock<HashMap<String, Contract>>>,
     trading_state: Arc<RwLock<TradingState>>,
+    order_tx: mpsc::Sender<OrderCommand>,
+    mut strategy_rx: mpsc::Receiver<runner::StrategyCommand>,
 ) {
     let client = match Client::connect("127.0.0.1:7496", 42).await {
         Ok(c) => Arc::new(c),
@@ -455,6 +472,7 @@ async fn subscription_manager(
     let mut subscribed: HashSet<ContractKey> = HashSet::new();
     let order_store: OrderStore = Arc::new(RwLock::new(HashMap::new()));
     let mut rate_limiter = risk::OrderRateLimiter::new(5, Duration::from_secs(2));
+    let mut strategy_runners: HashMap<String, (watch::Sender<bool>, JoinHandle<()>)> = HashMap::new();
     // Reverse lookup: client_order_id → IBKR order_id, so cancel/modify can resolve by UUID.
     let client_id_to_order_id: Arc<RwLock<HashMap<Uuid, i32>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -494,6 +512,7 @@ async fn subscription_manager(
                             max_order_size: 0,
                             multiplier: 1.0,
                             lot_size: 1,
+                            strategy: default_strategy(),
                         };
                         cache.insert(req.symbol.clone(), cfg.clone());
                         let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
@@ -1010,6 +1029,42 @@ async fn subscription_manager(
                     }
                 }
             }
+            Some(cmd) = strategy_rx.recv() => {
+                match cmd {
+                    runner::StrategyCommand::Set { symbol, strategy_name } => {
+                        // Stop existing runner for this symbol.
+                        if let Some((shutdown_tx, handle)) = strategy_runners.remove(&symbol) {
+                            let _ = shutdown_tx.send(true);
+                            let _ = handle.await;
+                        }
+
+                        if strategy_name == "none" {
+                            info!("Strategy cleared for {symbol}");
+                            continue;
+                        }
+
+                        match strategy::create_strategy(&strategy_name) {
+                            Some(strat) => {
+                                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                                let runner = runner::StrategyRunner::new(
+                                    symbol.clone(),
+                                    strat,
+                                    msg_tx.subscribe(),
+                                    order_tx.clone(),
+                                    position_cache.clone(),
+                                    config_cache.clone(),
+                                    shutdown_rx,
+                                );
+                                let handle = tokio::spawn(runner.run());
+                                strategy_runners.insert(symbol, (shutdown_tx, handle));
+                            }
+                            None => {
+                                warn!("Unknown strategy '{strategy_name}' for {symbol}");
+                            }
+                        }
+                    }
+                }
+            }
             else => break,
         }
     }
@@ -1111,7 +1166,8 @@ async fn ws_handler(
     let config_cache = state.config_cache.clone();
     let order_cache = state.order_cache.clone();
     let trading_state = state.trading_state.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, order_tx, bar_cache, position_cache, config_cache, order_cache, trading_state))
+    let strategy_tx = state.strategy_tx.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, msg_tx, subscribe_tx, order_tx, bar_cache, position_cache, config_cache, order_cache, trading_state, strategy_tx))
 }
 
 /// Single task handles both directions via `tokio::select!` so we detect client disconnect
@@ -1127,6 +1183,7 @@ async fn handle_socket(
     config_cache: Arc<RwLock<HashMap<String, ContractConfig>>>,
     order_cache: Arc<RwLock<HashMap<i32, OrderUpdate>>>,
     trading_state: Arc<RwLock<TradingState>>,
+    strategy_tx: mpsc::Sender<runner::StrategyCommand>,
 ) {
     // Broadcast receivers only see messages sent after they subscribe, so late-joining clients
     // would have no positions without this eager send from the cache.
@@ -1236,9 +1293,20 @@ async fn handle_socket(
                             }
                             Ok(ClientMessage::UpdateContractConfig(cfg)) => {
                                 info!(
-                                    "Config update for {}: autotrade={}, max_pos={}, min_pos={}, max_order={}, multiplier={}, lot_size={}",
-                                    cfg.symbol, cfg.autotrade, cfg.max_pos_size, cfg.min_pos_size, cfg.max_order_size, cfg.multiplier, cfg.lot_size
+                                    "Config update for {}: autotrade={}, max_pos={}, min_pos={}, max_order={}, multiplier={}, lot_size={}, strategy={}",
+                                    cfg.symbol, cfg.autotrade, cfg.max_pos_size, cfg.min_pos_size, cfg.max_order_size, cfg.multiplier, cfg.lot_size, cfg.strategy
                                 );
+                                // Detect strategy change and notify subscription_manager.
+                                {
+                                    let cache = config_cache.read().await;
+                                    let old_strategy = cache.get(&cfg.symbol).map(|c| c.strategy.as_str()).unwrap_or("none");
+                                    if old_strategy != cfg.strategy {
+                                        let _ = strategy_tx.send(runner::StrategyCommand::Set {
+                                            symbol: cfg.symbol.clone(),
+                                            strategy_name: cfg.strategy.clone(),
+                                        }).await;
+                                    }
+                                }
                                 config_cache.write().await.insert(cfg.symbol.clone(), cfg.clone());
                                 let _ = msg_tx.send(ServerMessage::ContractConfig(cfg));
                             }

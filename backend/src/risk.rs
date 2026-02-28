@@ -141,6 +141,7 @@ mod tests {
             max_order_size: max_order,
             multiplier: 1.0,
             lot_size: 1,
+            strategy: "none".to_string(),
         }
     }
 
